@@ -16,9 +16,20 @@ except Exception:
 
 st.set_page_config(page_title="Auction GM", layout="wide")
 
+# Read secrets in a robust way (supports both formats)
 SHEET_ID = st.secrets.get("SHEET_ID", "")
 SLEEPER_LEAGUE_ID = st.secrets.get("SLEEPER_LEAGUE_ID", "")
+
 SA_JSON = st.secrets.get("GOOGLE_SERVICE_ACCOUNT_JSON", None)
+# Fallback: accept a table like [gcp_service_account] or [google_service_account]
+if not SA_JSON:
+    for tbl_key in ("gcp_service_account", "google_service_account"):
+        if tbl_key in st.secrets:
+            # Reassemble a valid JSON blob from the table
+            info = dict(st.secrets[tbl_key])  # copy
+            SA_JSON = json.dumps(info)
+            break
+
 
 # ---------------- Helpers ----------------
 @st.cache_data(ttl=300)
