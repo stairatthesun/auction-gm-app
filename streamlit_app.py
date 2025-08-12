@@ -1,7 +1,15 @@
-# streamlit_app.py — v7 (clean UX: spinner+toast, safe buttons)
+# streamlit_app.py — v8
+# - Clean UX (spinner+toast), busy-guarded buttons
+# - Practice Mode
+# - Archive & Reset + Reset (No Archive) + optional Purge Archives
+# - Robust Secrets reader (GOOGLE_SERVICE_ACCOUNT_JSON OR [gcp_service_account] table)
+# - Sleeper league header
+# - NEW: Upload raw FFA CSV -> clean & map -> write to Google Sheet "Projections"
 
 import json
 from datetime import datetime
+import io
+import pandas as pd
 import requests
 import streamlit as st
 
@@ -16,11 +24,19 @@ except Exception:
 
 st.set_page_config(page_title="Auction GM", layout="wide")
 
+# ------------- Secrets (robust) -------------
 SHEET_ID = st.secrets.get("SHEET_ID", "")
 SLEEPER_LEAGUE_ID = st.secrets.get("SLEEPER_LEAGUE_ID", "")
-SA_JSON = st.secrets.get("GOOGLE_SERVICE_ACCOUNT_JSON", None)
 
-# ---------------- Helpers ----------------
+SA_JSON = st.secrets.get("GOOGLE_SERVICE_ACCOUNT_JSON", None)
+# Fallback: accept a table like [gcp_service_account] or [google_service_account]
+if not SA_JSON:
+    for tbl_key in ("gcp_service_account", "google_service_account"):
+        if tbl_key in st.secrets:
+            SA_JSON = json.dumps(dict(st.secrets[tbl_key]))
+            break
+
+# ------------- Helpers -------------
 @st.cache_data(ttl=300)
 def sleeper_get(path):
     url = f"https://api.sleeper.app/v1/{path.lstrip('/')}"
@@ -131,8 +147,39 @@ def archive_and_reset(sh):
         return False, msg
     return True, f"Archived to {archive_title} and reset live tabs."
 
-# ---------------- UI ----------------
-st.title("🏈 Auction GM — v7 Starter (Reset + Practice)")
+def purge_archives(sh, keep_latest=True):
+    """Delete Archive_* worksheets. If keep_latest=True, keeps the newest one."""
+    try:
+        ws_list = sh.worksheets()
+        archives = [ws for ws in ws_list if ws.title.startswith("Archive_")]
+        if not archives:
+            return True, "No archive tabs found."
+        archives.sort(key=lambda ws: ws.title, reverse=True)
+        to_delete = archives[1:] if keep_latest and len(archives) > 1 else archives
+        for ws in to_delete:
+            sh.del_worksheet(ws)
+        kept = archives[0].title if keep_latest and archives else None
+        return True, f"Purged {len(to_delete)} archive tab(s)." + (f" Kept {kept}." if kept else "")
+    except Exception as e:
+        return False, f"Purge failed: {e}"
+
+def upsert_worksheet(sh, title, rows=5000, cols=30):
+    """Get worksheet by title or create if missing."""
+    try:
+        return sh.worksheet(title)
+    except Exception:
+        sh.add_worksheet(title=title, rows=rows, cols=cols)
+        return sh.worksheet(title)
+
+def write_dataframe_to_sheet(ws, df: pd.DataFrame, header=True):
+    """Overwrite entire worksheet area with df (headers + values)."""
+    values = [df.columns.tolist()] + df.fillna("").astype(str).values.tolist() if header else df.fillna("").astype(str).values.tolist()
+    # Clear a big range then write once
+    ws.batch_clear(["A1:Z100000"])
+    ws.update("A1", values, value_input_option="RAW")
+
+# ------------- UI -------------
+st.title("🏈 Auction GM — v8")
 
 # Sidebar: connection + modes
 with st.sidebar:
@@ -166,12 +213,11 @@ with st.sidebar:
     st.divider()
     st.header("Draft Controls")
 
-    # Use a simple busy guard to prevent double-click spam
     if "busy" not in st.session_state:
         st.session_state["busy"] = False
 
     # Archive & Reset
-    clicked_archive = st.button("📦 Archive & Reset", use_container_width=True, type="primary", disabled=not (write_ready and not practice or not write_ready))
+    clicked_archive = st.button("📦 Archive & Reset", use_container_width=True, type="primary", disabled=not (write_ready and not practice))
     if clicked_archive and write_ready and not practice and not st.session_state["busy"]:
         st.session_state["busy"] = True
         try:
@@ -194,7 +240,18 @@ with st.sidebar:
         finally:
             st.session_state["busy"] = False
 
-# League header info (from Sleeper)
+    # Purge older archives (keep latest)
+    clicked_purge = st.button("🧹 Purge Archives (keep latest)", use_container_width=True, disabled=not (write_ready and not practice))
+    if clicked_purge and write_ready and not practice and not st.session_state["busy"]:
+        st.session_state["busy"] = True
+        try:
+            with st.spinner("Purging archive tabs…"):
+                ok, msg = purge_archives(sh, keep_latest=True)
+            st.toast(msg if ok else f"⚠️ {msg}")
+        finally:
+            st.session_state["busy"] = False
+
+# League header (Sleeper)
 col1, col2, col3 = st.columns(3)
 if SLEEPER_LEAGUE_ID:
     try:
@@ -208,6 +265,105 @@ else:
     st.info("Add SLEEPER_LEAGUE_ID in Secrets to fetch league info.")
 
 st.divider()
-st.subheader("Players — coming next")
-st.write("Next we’ll wire this to your `Players` tab for search/drafted/price input and refresh ADP/AAV.")
-st.caption("Tip: Practice Mode leaves your sheet untouched; toggle it off to enable Archive/Reset.")
+
+# ------------- NEW: FFA CSV Upload -> Clean -> Write to Sheet -------------
+st.subheader("📥 Import Projections (Raw FFA CSV → Projections sheet)")
+
+st.caption("Upload the unedited CSV from FFA Season Projections. The app will drop unneeded columns, rename to the expected schema, and write it to the 'Projections' tab in your backend.")
+
+uploaded = st.file_uploader("Upload FFA CSV", type=["csv"], accept_multiple_files=False)
+
+# Desired output schema and canonical order
+target_cols = [
+    "Position",
+    "Player",
+    "Team",
+    "Points",
+    "VOR",
+    "ADP",
+    "AAV",
+    "Rank Overall",
+    "Rank Position",
+]
+
+# Flexible column name mapping (lowercased keys)
+name_map = {
+    "position": "Position",
+    "pos": "Position",
+    "player": "Player",
+    "name": "Player",
+    "team": "Team",
+    "tm": "Team",
+    "points": "Points",
+    "proj_points": "Points",
+    "proj_fp": "Points",
+    "fp": "Points",
+    "vor": "VOR",
+    "points_vor": "VOR",
+    "value_over_replacement": "VOR",
+    "adp": "ADP",
+    "aav": "AAV",
+    "auction_value": "AAV",
+    "rank": "Rank Overall",
+    "overall_rank": "Rank Overall",
+    "rank_overall": "Rank Overall",
+    "position_rank": "Rank Position",
+    "pos_rank": "Rank Position",
+    "rank_position": "Rank Position",
+}
+
+def clean_projection_csv(file_bytes: bytes) -> pd.DataFrame:
+    df = pd.read_csv(io.BytesIO(file_bytes))
+    # Build a mapping from existing columns -> target names
+    col_map = {}
+    for c in df.columns:
+        key = str(c).strip().lower()
+        if key in name_map:
+            col_map[c] = name_map[key]
+    df = df.rename(columns=col_map)
+
+    # Keep only target columns; create missing ones empty
+    for col in target_cols:
+        if col not in df.columns:
+            df[col] = None
+    df = df[target_cols]
+
+    # Coerce numeric fields
+    for col in ["Points", "VOR", "ADP", "AAV", "Rank Overall", "Rank Position"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # Drop rows with no player name
+    df = df[df["Player"].notna() & (df["Player"].astype(str).str.strip() != "")]
+    df = df.reset_index(drop=True)
+    return df
+
+if uploaded is not None:
+    try:
+        with st.spinner("Parsing and cleaning CSV…"):
+            cleaned = clean_projection_csv(uploaded.read())
+        st.success(f"Loaded {len(cleaned):,} players. Preview below:")
+        st.dataframe(cleaned.head(20), use_container_width=True)
+        st.caption("Columns ↓ match the backend schema exactly:")
+        st.code(", ".join(cleaned.columns.tolist()))
+        can_write = write_ready and not practice
+        btn = st.button("✍️ Write to Google Sheet → 'Projections'", type="primary", disabled=not can_write)
+        if btn:
+            if not write_ready:
+                st.toast("⚠️ Write access not enabled.")
+            elif practice:
+                st.toast("ℹ️ Turn off Practice Mode to write to the sheet.")
+            else:
+                try:
+                    with st.spinner("Writing cleaned data to 'Projections'…"):
+                        ws_proj = upsert_worksheet(sh, "Projections", rows=max(5000, len(cleaned)+10), cols=len(target_cols)+3)
+                        write_dataframe_to_sheet(ws_proj, cleaned, header=True)
+                    st.toast("✅ Projections updated in Google Sheet.")
+                except Exception as e:
+                    st.error(f"Write failed: {e}")
+    except Exception as e:
+        st.error(f"Could not read CSV: {e}")
+
+st.divider()
+st.subheader("Players — Draft Board (coming next)")
+st.write("Next update wires the Players table (search/filters/drafted/price) and shows Soft/Hard Recommended $ computed from these projections plus your league context.")
+st.caption("Tip: Keep Practice Mode ON for safe testing; toggle OFF only when you’re ready to write.")
