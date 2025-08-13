@@ -1,8 +1,5 @@
-# streamlit_app.py — Auction GM (Teams module + Phase Budgets + robust Reset)
-# Notes:
-# - Keep your current secrets and backend sheet (v7).
-# - My Team must be row 2 in League_Teams ('team_name' = "My Team").
-# - This build keeps all working features and adds Teams & Needs.
+# streamlit_app.py — Auction GM (Teams, Draft Log + Trends, Best Values, Heatmap, Trap Finder)
+# Cleaned: removed Phase Budgets; added FFG_Avoid tag; robust "My Team" guard; keeps all core draft features.
 
 import io, json
 from datetime import datetime
@@ -92,15 +89,19 @@ def choose_keys(df_left, df_right):
     return None
 
 def get_tag_columns(df: pd.DataFrame):
-    # Find or create tag columns so Tag editor always works
     if df is None or df.empty:
         return []
     cols = [c for c in df.columns if c.upper().startswith(("FFG_","FFB_"))]
     if not cols:
-        for c in ["FFG_MyGuy","FFG_Sleeper","FFG_Bust","FFG_Value","FFG_Breakout"]:
+        # Create the common ones in-memory (write happens when toggled)
+        cols = ["FFG_MyGuy","FFG_Sleeper","FFG_Bust","FFG_Value","FFG_Breakout","FFG_Avoid"]
+        for c in cols:
             if c not in df.columns:
                 df[c] = ""
-        return ["FFG_MyGuy","FFG_Sleeper","FFG_Bust","FFG_Value","FFG_Breakout"]
+    else:
+        # Ensure Avoid exists too
+        if "FFG_Avoid" not in cols:
+            cols.append("FFG_Avoid")
     return cols
 
 def is_truthy(v):
@@ -409,7 +410,7 @@ def decrement_slot_for_pick(row, position, open_map):
     if p in ("RB","WR","TE"):
         if open_map.get(p) and int(pd.to_numeric(row.get(open_map[p],0), errors="coerce") or 0)>0:
             dec(open_map[p]); return
-        if open_map.get("FLEX") and int(pd.to_numeric(row.get(open_map["FLEX"],0), errors="coerce") or 0)>0:
+        if open_map.get("FLEX") and int(pd.to_numeric(row.get("open_FLEX", row.get("open_flex",0)), errors="coerce") or 0)>0:
             dec(open_map["FLEX"]); return
         if open_map.get("BENCH"):
             dec(open_map["BENCH"]); return
@@ -477,9 +478,8 @@ def update_player_drafted(sh, player_key, manager, price):
     write_dataframe_to_sheet(ws, df, header=True)
     return True
 
-# --------------------------- Reset & Archive (enhanced) ---------------------------
+# --------------------------- Reset & Archive ---------------------------
 def ensure_league_columns(df):
-    # Ensure required League_Teams columns exist
     need_cols = ["team_name","budget_remaining","players_owned","max_bid","(auto)_$per_open_slot"]
     for k in DEFAULT_SLOTS.keys():
         need_cols.append(k)
@@ -491,19 +491,18 @@ def ensure_league_columns(df):
     return df
 
 def ensure_player_columns(df):
-    need_cols = ["status","drafted_by","price_paid","(auto) inflation_index","soft_rec_$","hard_cap_$"]
+    need_cols = ["status","drafted_by","price_paid","(auto) inflation_index","soft_rec_$","hard_cap_$",
+                 "FFG_MyGuy","FFG_Sleeper","FFG_Bust","FFG_Value","FFG_Breakout","FFG_Avoid"]
     for c in need_cols:
         if c not in df.columns:
             df[c] = ""
     return df
 
 def reset_players_and_league(sh):
-    # Players
     try:
         ws = sh.worksheet("Players")
         df = normalize_cols(ws_to_df(ws))
         df = ensure_player_columns(df)
-        # Clear drafted fields & auto fields
         df["status"] = ""
         df["drafted_by"] = ""
         df["price_paid"] = ""
@@ -514,31 +513,30 @@ def reset_players_and_league(sh):
     except Exception as e:
         return False, f"Players reset failed: {e}"
 
-    # League_Teams
     try:
         ws = sh.worksheet("League_Teams")
         df = normalize_cols(ws_to_df(ws))
         df = ensure_league_columns(df)
 
-        # Validate My Team lock (row 2 must be "My Team")
-        if df.empty or "team_name" not in df.columns or len(df) < 2 or str(df.loc[df.index[1],"team_name"]).strip() != "My Team":
+        # Robust "My Team" check: row 2 is first data row -> index[0]
+        if df.empty or "team_name" not in df.columns:
+            return False, "League_Teams missing 'team_name' column."
+        first_row_idx = df.index[0]
+        if str(df.loc[first_row_idx,"team_name"]).strip().lower() != "my team":
             return False, "League_Teams row 2 must be 'My Team'. Fix and rerun."
 
-        # Reset every team (keep team_name)
         for i in df.index:
-            # reset budget
             df.at[i,"budget_remaining"] = int(DEFAULT_BUDGET)
-            # reset open_* (prefer *_start if present)
             for k, default_val in DEFAULT_SLOTS.items():
                 start_col = f"{k}_start"
-                if start_col in df.columns:
-                    df.at[i, k] = int(pd.to_numeric(df.at[i,start_col], errors="coerce") if pd.notna(df.at[i,start_col]) else default_val)
+                if start_col in df.columns and pd.notna(df.at[i,start_col]) and str(df.at[i,start_col]).strip()!="":
+                    df.at[i, k] = int(pd.to_numeric(df.at[i,start_col], errors="coerce") or default_val)
                 else:
                     df.at[i, k] = int(default_val)
-            # derived
             total = sum(int(pd.to_numeric(df.at[i,k], errors="coerce") or 0) for k in DEFAULT_SLOTS.keys())
             df.at[i,"players_owned"] = 0
-            max_bid, pps = recompute_maxbid_and_pps(df.loc[i,:], detect_open_cols(df))
+            open_map = detect_open_cols(df)
+            max_bid, pps = recompute_maxbid_and_pps(df.loc[i,:], open_map)
             df.at[i,"max_bid"] = int(max_bid)
             df.at[i,"(auto)_$per_open_slot"] = int(pps)
 
@@ -546,7 +544,6 @@ def reset_players_and_league(sh):
     except Exception as e:
         return False, f"League_Teams reset failed: {e}"
 
-    # Draft_Log: clear or create fresh
     try:
         ws_log = upsert_worksheet(sh, "Draft_Log")
         ws_log.clear()
@@ -584,7 +581,6 @@ def build_nomination_list(players_df: pd.DataFrame, league_df: pd.DataFrame, top
             df[c] = "" if c not in ("soft_rec_$","AAV","ADP","VOR","Points","Rank Position") else float("nan")
 
     df = df[~df["status"].astype(str).str.lower().eq("drafted")].copy()
-
     for c in ["soft_rec_$","AAV","ADP","VOR","Points","Rank Position"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
@@ -598,7 +594,7 @@ def build_nomination_list(players_df: pd.DataFrame, league_df: pd.DataFrame, top
     df["value_surplus"] = df["soft_rec_$"] - base_val
 
     pos_list = df["Position"].dropna().unique().tolist()
-    pos_supply = {p: max(1, int((df["Position"] == p).sum())) for p in pos_list}
+    pos_supply = {p: max(1, int((df["Position"] == p).count())) for p in pos_list}
 
     scarcity = {}
     if league_df is not None and not league_df.empty:
@@ -606,7 +602,8 @@ def build_nomination_list(players_df: pd.DataFrame, league_df: pd.DataFrame, top
         if open_map:
             flex_total = 0
             if "FLEX" in open_map:
-                flex_total = pd.to_numeric(league_df.get(open_map["FLEX"]), errors="coerce").fillna(0).sum()
+                fcol = open_map["FLEX"]
+                flex_total = pd.to_numeric(league_df.get(fcol), errors="coerce").fillna(0).sum()
             for p in pos_list:
                 base_need = 0
                 if p in open_map:
@@ -721,12 +718,9 @@ with st.sidebar:
         st.toast(msg if ok else f"⚠️ {msg}")
         st.cache_data.clear(); st.rerun()
 
-    st.button("🔁 Refresh Data (clear cache)", on_click=lambda: (st.cache_data.clear(), st.toast("Caches cleared; reloading…"), st.rerun()))
-
     if admin_mode:
         st.divider()
         st.header("Admin")
-        # Import projections
         up = st.file_uploader("📥 Import Projections CSV → Projections sheet", type=["csv"], accept_multiple_files=False, key="proj_csv")
         mode = st.selectbox("Write mode", ["Replace Projections", "Append to Projections"], index=0)
         do_import = st.button("Import CSV", use_container_width=True, disabled=not (write_ready and up is not None and not practice))
@@ -752,7 +746,6 @@ with st.sidebar:
             except Exception as e:
                 st.error(f"Import failed: {e}")
 
-        # Reset & Archive
         c1, c2 = st.columns(2)
         with c1:
             if st.button("🗂️ Reset & Archive", use_container_width=True, disabled=not (write_ready and not practice)):
@@ -778,6 +771,7 @@ if SLEEPER_LEAGUE_ID:
 # ----------------- Load data (cached) -----------------
 players_df = pd.DataFrame()
 league_df = pd.DataFrame()
+draft_log_df = pd.DataFrame()
 if 'sh' in locals() and write_ready:
     try:
         players_df = normalize_cols(ws_to_df_cached(SHEET_ID, "Players", SA_JSON))
@@ -791,21 +785,19 @@ if 'sh' in locals() and write_ready:
         st.error(f"Could not load Players sheet: {e}")
     try:
         league_df = normalize_cols(ws_to_df_cached(SHEET_ID, "League_Teams", SA_JSON))
-        # Guard: My Team must be the first data row (Google Sheets row 2)
-        if not league_df.empty:
-            # Normalize header and values
-            if "team_name" not in league_df.columns:
-                st.error("League_Teams is missing a 'team_name' column (exact header required).")
-                st.stop()
-
-            first_row_idx = league_df.index[0]  # first data row == Google Sheets row 2
-            val = str(league_df.loc[first_row_idx, "team_name"]).strip().lower()
+        # Robust guard: My Team in row 2 (first data row)
+        if not league_df.empty and "team_name" in league_df.columns:
+            first_idx = league_df.index[0]
+            val = str(league_df.loc[first_idx, "team_name"]).strip().lower()
             if val != "my team":
-                st.error("League_Teams row 2 (first data row) must have team_name = 'My Team'. Please fix and reload.")
+                st.error("League_Teams row 2 must be 'My Team'. Please fix and reload.")
                 st.stop()
-
     except Exception:
         league_df = pd.DataFrame()
+    try:
+        draft_log_df = normalize_cols(ws_to_df_cached(SHEET_ID, "Draft_Log", SA_JSON))
+    except Exception:
+        draft_log_df = pd.DataFrame()
 
 # Ensure required columns exist (avoid KeyErrors)
 if players_df is None or players_df.empty:
@@ -814,47 +806,11 @@ for c in ["status","Position","Player","Team","soft_rec_$","AAV","ADP","VOR","Po
     if c not in players_df.columns:
         players_df[c] = (float("nan") if c in ("soft_rec_$","AAV","ADP","VOR","Points","Rank Overall","Rank Position") else "")
 
-# --------------------------- Phase Budgets (above filters) ---------------------------
-if 'sh' in locals() and write_ready:
-    rows=[]
-    try:
-        ws = sh.worksheet("Phase_Budgets")
-        pdf = normalize_cols(ws_to_df(ws))
-        if not pdf.empty:
-            for c in ("phase","target","spent","remain"):
-                if c not in pdf.columns: pdf[c]=""
-            rows = pdf.to_dict("records")
-    except Exception:
-        rows=[]
-    with st.expander("🎯 Phase Budgets", expanded=False):
-        if rows:
-            cols = st.columns(min(len(rows), 6))
-            for i, r in enumerate(rows[:6]):
-                try:
-                    tgt = "—" if not r.get("target") else f"${int(pd.to_numeric(r['target'], errors='coerce')):,}"
-                    sp  = "—" if not r.get("spent")  else f"${int(pd.to_numeric(r['spent'],  errors='coerce')):,}"
-                    rm  = "—" if not r.get("remain") else f"${int(pd.to_numeric(r['remain'], errors='coerce')):,}"
-                    cols[i].metric(r.get("phase","Phase"), f"{rm} left", f"{sp} spent / {tgt} target")
-                except Exception:
-                    pass
-        else:
-            st.caption("No phase budget rows defined.")
-
-# --------------------------- Teams Module (top row, right of Phase Budgets) ---------------------------
+# --------------------------- Helper views ---------------------------
 def build_team_roster_view(players: pd.DataFrame, team_name: str):
-    """
-    Returns (roster_df, summary_dict)
-    roster_df has rows for slots: QB/RB/RB/WR/WR/TE/FLEX + BENCH slots
-    """
-    # Pull drafted players for this team
     drafted = players[(players.get("status","").astype(str).str.lower()=="drafted") &
                       (players.get("drafted_by","").astype(str)==team_name)].copy()
 
-    # Slot template
-    slots = ["QB", "RB", "RB", "WR", "WR", "TE", "FLEX"]
-    bench_n = DEFAULT_SLOTS.get("open_BENCH", 6)
-
-    # Fill structure
     rows = [{"Slot":"QB","Player":"","Pos":"","Price":""},
             {"Slot":"RB","Player":"","Pos":"","Price":""},
             {"Slot":"RB","Player":"","Pos":"","Price":""},
@@ -862,48 +818,35 @@ def build_team_roster_view(players: pd.DataFrame, team_name: str):
             {"Slot":"WR","Player":"","Pos":"","Price":""},
             {"Slot":"TE","Player":"","Pos":"","Price":""},
             {"Slot":"FLEX","Player":"","Pos":"","Price":""}]
-    for i in range(bench_n):
+    for i in range(DEFAULT_SLOTS.get("open_BENCH", 6)):
         rows.append({"Slot":f"BENCH{i+1}","Player":"","Pos":"","Price":""})
 
     def place(player_row):
         pos = str(player_row["Position"]).upper()
         price = safe_int_or(player_row.get("price_paid"), default=0)
         name = str(player_row["Player"])
-        # Try true position first
         if pos in ("QB","RB","WR","TE"):
             for r in rows:
                 if r["Slot"]==pos and r["Player"]=="":
                     r.update({"Player":name,"Pos":pos,"Price":f"${price}"}); return
-            # Try FLEX for RB/WR/TE
             if pos in ("RB","WR","TE"):
                 for r in rows:
                     if r["Slot"]=="FLEX" and r["Player"]=="":
                         r.update({"Player":name,"Pos":pos,"Price":f"${price}"}); return
-        # Else BENCH
         for r in rows:
             if r["Slot"].startswith("BENCH") and r["Player"]=="":
                 r.update({"Player":name,"Pos":pos,"Price":f"${price}"}); return
 
     for _, prow in drafted.sort_values(by="price_paid", ascending=False).iterrows():
         place(prow)
-
-    roster_df = pd.DataFrame(rows)
-    # Summary (spots & budget remaining pulled from League_Teams already on page)
-    return roster_df
+    return pd.DataFrame(rows)
 
 def biggest_needs_for_team(league_row: pd.Series, players_pool: pd.DataFrame):
-    """
-    Return list of (POS, slots_left, high_value_left) sorted by urgency.
-    'high_value_left' = count of remaining UNDRAFTED players at that position with soft_rec_$ >= median
-    """
-    # open_* map
     open_map = detect_open_cols(pd.DataFrame([league_row]))
-    # Remaining pool
     p = players_pool.copy()
     p = p[~p.get("status","").astype(str).str.lower().eq("drafted")]
-    # median soft_rec for threshold
-    thr = pd.to_numeric(p.get("soft_rec_$"), errors="coerce")
-    thresh = thr.median(skipna=True) if thr.notna().any() else 0
+    thr_ser = pd.to_numeric(p.get("soft_rec_$"), errors="coerce")
+    thresh = thr_ser.median(skipna=True) if thr_ser.notna().any() else 0
 
     needs = []
     for pos_key, open_col in open_map.items():
@@ -912,37 +855,80 @@ def biggest_needs_for_team(league_row: pd.Series, players_pool: pd.DataFrame):
         slots_left = safe_int_or(league_row.get(open_col), 0)
         if slots_left <= 0:
             continue
-        # FLEX contributes across RB/WR/TE, but we treat per true pos
         if pos_key in ("FLEX","BENCH"):
             continue
-        # High-value left
-        left_cnt = 0
         mask_pos = p.get("Position","").astype(str).str.upper().eq(pos_key)
         hp = pd.to_numeric(p.loc[mask_pos, "soft_rec_$"], errors="coerce")
-        if hp.notna().any():
-            left_cnt = int((hp >= thresh).sum())
+        left_cnt = int((hp >= thresh).sum()) if hp.notna().any() else 0
         needs.append((pos_key, int(slots_left), int(left_cnt)))
 
-    # urgency: more slots_left & fewer high_value_left -> higher priority
     needs.sort(key=lambda x: (x[1], -x[2]), reverse=True)
     return needs
 
+# --------------------------- NEW TOP ROW: Draft Log + Trends | Best Values | Teams ---------------------------
 st.divider()
-top_left, top_right = st.columns([1.2, 1.1], vertical_alignment="top")
-with top_right:
+c_log, c_best, c_team = st.columns([1.2,1.1,1.2], vertical_alignment="top")
+
+with c_log:
+    st.subheader("🧾 Draft Log + Live Trends")
+    # Draft Log (last 10)
+    if draft_log_df is not None and not draft_log_df.empty:
+        show_cols = ["timestamp","player","team","position","manager","price"]
+        for c in show_cols:
+            if c not in draft_log_df.columns: draft_log_df[c] = ""
+        st.dataframe(draft_log_df[show_cols].tail(10), hide_index=True, height=220, use_container_width=True)
+    else:
+        st.caption("No picks yet.")
+
+    # Live Trends (lightweight)
+    # Inflation approximation from Players
+    try:
+        dfp = players_df.copy()
+        dfp["soft_rec_$"] = pd.to_numeric(dfp.get("soft_rec_$"), errors="coerce")
+        dfp["price_paid"] = pd.to_numeric(dfp.get("price_paid"), errors="coerce")
+        drafted_mask = dfp.get("status","").astype(str).str.lower().eq("drafted")
+        exp = dfp.loc[drafted_mask, "soft_rec_$"].sum(skipna=True)
+        act = dfp.loc[drafted_mask, "price_paid"].sum(skipna=True)
+        infl = (act/exp) if exp and exp>0 else 1.0
+        infl = max(0.5, min(1.8, infl))
+        teams_left = league_df["team_name"].nunique() if not league_df.empty and "team_name" in league_df.columns else 0
+        money_left = pd.to_numeric(league_df.get("budget_remaining"), errors="coerce").fillna(0).sum() if "budget_remaining" in league_df.columns else 0
+        st.metric("Inflation (est.)", f"{infl:.2f}×")
+        st.caption(f"Money remaining across league: ${int(money_left):,} • Teams: {teams_left}")
+    except Exception:
+        pass
+
+with c_best:
+    st.subheader("💎 Best Remaining Values")
+    if players_df.empty:
+        st.caption("Load players first.")
+    else:
+        v = players_df.copy()
+        for c in ["soft_rec_$","AAV","VOR","Points","ADP"]:
+            if c in v.columns: v[c]=pd.to_numeric(v[c], errors="coerce")
+        v = v[~v.get("status","").astype(str).str.lower().eq("drafted")]
+        base = v["AAV"].copy()
+        if base.isna().all():
+            base = (v["soft_rec_$"]/1.15)
+        v["surplus_$"] = (v["soft_rec_$"] - base).round(0)
+        cols = ["Position","Player","Team","soft_rec_$","AAV","surplus_$","VOR","ADP"]
+        for c in cols:
+            if c not in v.columns: v[c]=""
+        v = v.sort_values(by=["surplus_$","soft_rec_$"], ascending=[False,False]).head(12)
+        st.dataframe(v[cols], hide_index=True, height=300, use_container_width=True)
+
+with c_team:
     st.subheader("👥 Teams")
     if league_df.empty or "team_name" not in league_df.columns:
         st.caption("League_Teams not available.")
     else:
         team_options = [t for t in league_df["team_name"].astype(str).tolist() if t.strip()]
-        # default to My Team (row 2)
         default_team = "My Team" if "My Team" in team_options else (team_options[0] if team_options else "")
         selected_team = st.selectbox("Team", team_options, index=team_options.index(default_team) if default_team in team_options else 0, key="teams_selector")
 
         roster_df = build_team_roster_view(players_df, selected_team)
         st.dataframe(roster_df, hide_index=True, height=290, use_container_width=True)
 
-        # League row for selected team
         lr = league_df.loc[league_df["team_name"].astype(str)==selected_team]
         if not lr.empty:
             row = lr.iloc[0]
@@ -953,19 +939,12 @@ with top_right:
                     total_slots += safe_int_or(row.get(col), 0)
             budget_rem = safe_int_or(row.get("budget_remaining"), DEFAULT_BUDGET)
             st.caption(f"Spots remaining: **{total_slots}** • Budget remaining: **${budget_rem}** • $/slot ≈ **${(budget_rem//max(1,total_slots))}**")
-
-        # Biggest needs for the selected team
-        if not lr.empty:
-            needs = biggest_needs_for_team(lr.iloc[0], players_df)
+            needs = biggest_needs_for_team(row, players_df)
             if needs:
                 txt = " • ".join([f"{p} ({s} slots, {hv} HV left)" for p,s,hv in needs[:3]])
                 st.caption(f"Top needs: {txt}")
             else:
                 st.caption("Top needs: —")
-
-with top_left:
-    st.subheader("🎯 Phase Budgets")
-    # (already drawn above via expander; this header just aligns the row visually)
 
 # --------------------------- Filters ---------------------------
 st.divider()
@@ -998,6 +977,7 @@ else:
         if is_truthy(row.get("FFG_Bust", row.get("FFB_Bust",""))): out.append("⚠️")
         if is_truthy(row.get("FFG_Value", row.get("FFB_Value",""))): out.append("💎")
         if is_truthy(row.get("FFG_Breakout", row.get("FFB_Breakout",""))): out.append("🚀")
+        if is_truthy(row.get("FFG_Avoid","")): out.append("⛔")
         return " ".join(out)
     view["Tags"] = view.apply(tag_icons, axis=1) if not view.empty else ""
 
@@ -1093,20 +1073,19 @@ else:
             except Exception as e:
                 st.error(f"Draft failed: {e}")
 
-# --------------------------- League‑wide #1 Need (always visible) ---------------------------
+# --------------------------- League: #1 Need per Team (compact) ---------------------------
 st.subheader("📊 League: #1 Need per Team")
 if not league_df.empty and "team_name" in league_df.columns:
-    # Build compact table of top need per team
     rows=[]
     for _, t in league_df.iterrows():
         needs = biggest_needs_for_team(t, players_df)
         if needs:
             pos, slots, hv = needs[0]
-            rows.append({"Team": t.get("team_name",""), "Top Need": pos, "Slots Left": slots, "Hi‑Value Left": hv})
+            rows.append({"Team": t.get("team_name",""), "Top Need": pos, "Slots Left": slots, "Hi-Value Left": hv})
         else:
-            rows.append({"Team": t.get("team_name",""), "Top Need": "—", "Slots Left": 0, "Hi‑Value Left": 0})
+            rows.append({"Team": t.get("team_name",""), "Top Need": "—", "Slots Left": 0, "Hi-Value Left": 0})
     need_df = pd.DataFrame(rows)
-    st.dataframe(need_df, hide_index=True, use_container_width=True, height=220)
+    st.dataframe(need_df, hide_index=True, use_container_width=True, height=200)
 else:
     st.caption("League_Teams not available.")
 
@@ -1135,8 +1114,72 @@ with st.expander("🧠 Nomination Recommendations (position-aware)", expanded=Fa
                 if c not in enf_list.columns: enf_list[c]=""
             st.dataframe(enf_list[cols], hide_index=True, use_container_width=True, height=240)
 
-# --------------------------- Quick Tag Editor (sticky open) ---------------------------
-with st.expander("🏷️ Quick Tag Editor", expanded=True):  # keep open to avoid auto-collapse annoyance
+# --------------------------- NEW: Bidding Heatmap ---------------------------
+with st.expander("🔥 Bidding Heatmap (who can bid for what)", expanded=False):
+    if league_df.empty or "team_name" not in league_df.columns:
+        st.caption("League_Teams not available.")
+    else:
+        open_map = detect_open_cols(league_df)
+        teams = league_df["team_name"].tolist()
+        heat = pd.DataFrame(index=teams, columns=["QB","RB","WR","TE","FLEX","K","DST"])
+        for _, t in league_df.iterrows():
+            team = t.get("team_name","")
+            br = safe_int_or(t.get("max_bid", t.get("budget_remaining", 0)), 0)
+            for pos in ["QB","RB","WR","TE","FLEX","K","DST"]:
+                can = has_slot_for_position(t, pos, open_map)
+                heat.at[team, pos] = br if can else 0
+        st.dataframe(heat.fillna(0).astype(int), use_container_width=True, height=240)
+        st.caption("Cell shows each team’s effective max bid for that position (0 = no open slot).")
+
+# --------------------------- NEW: Nomination Trap Finder ---------------------------
+with st.expander("🪤 Nomination Trap Finder", expanded=False):
+    if players_df.empty:
+        st.caption("Load players first.")
+    else:
+        dfT = players_df.copy()
+        for c in ["soft_rec_$","AAV","ADP"]:
+            if c in dfT.columns: dfT[c]=pd.to_numeric(dfT[c], errors="coerce")
+        dfT = dfT[~dfT.get("status","").astype(str).str.lower().eq("drafted")]
+
+        base = dfT["AAV"].copy()
+        if base.isna().all():
+            base = (dfT["soft_rec_$"]/1.15)
+        dfT["surplus_$"] = (dfT["soft_rec_$"] - base)
+
+        # Trap = Negative surplus OR tagged Avoid, but with decent ADP (market demand) or many outbidders
+        # Reuse outbid_count quickly
+        outbid = []
+        if not league_df.empty and "budget_remaining" in league_df.columns:
+            open_map = detect_open_cols(league_df)
+            for _, r in dfT.iterrows():
+                price = r.get("AAV") if pd.notna(r.get("AAV")) else r.get("soft_rec_$")
+                pos = r.get("Position","")
+                cnt=0
+                for _, t in league_df.iterrows():
+                    br = pd.to_numeric(t.get("budget_remaining",""), errors="coerce")
+                    if pd.isna(price) or pd.isna(br) or br < price: 
+                        continue
+                    if open_map and not has_slot_for_position(t, pos, open_map):
+                        continue
+                    cnt+=1
+                outbid.append(cnt)
+        dfT["outbid_count"] = outbid if outbid else 0
+
+        avoid_mask = dfT.get("FFG_Avoid","").astype(str).str.lower().isin(["true","1","yes","y"])
+        trap_mask = (dfT["surplus_$"] < 0) | avoid_mask
+        # "demand" proxy: better ADP (lower number) or many outbidders
+        demand = (-dfT["ADP"].fillna(999)).rank(pct=True) + (dfT["outbid_count"]).rank(pct=True)
+        dfT["trap_score"] = demand + (-dfT["surplus_$"].fillna(0)).rank(pct=True)
+
+        traps = dfT[trap_mask].sort_values(by=["trap_score"], ascending=False).head(12)
+        cols = ["Position","Player","Team","AAV","soft_rec_$","surplus_$","ADP","outbid_count"]
+        for c in cols:
+            if c not in traps.columns: traps[c]=""
+        st.dataframe(traps[cols], hide_index=True, use_container_width=True, height=280)
+        st.caption("Players likely to go for too much (negative value or tagged Avoid) but still in demand. Consider nominating early.")
+
+# --------------------------- Quick Tag Editor (sticky open, includes Avoid) ---------------------------
+with st.expander("🏷️ Quick Tag Editor", expanded=True):
     if players_df.empty:
         st.caption("Load and sync players first.")
     else:
@@ -1148,7 +1191,7 @@ with st.expander("🏷️ Quick Tag Editor", expanded=True):  # keep open to avo
         pretty = []; map_pretty={}
         for c in tag_cols:
             base = c.replace("FFG_","").replace("FFB_","")
-            label = {"MyGuy":"My Guy","Sleeper":"Sleeper","Bust":"Bust","Value":"Value","Breakout":"Breakout"}.get(base, base)
+            label = {"MyGuy":"My Guy","Sleeper":"Sleeper","Bust":"Bust","Value":"Value","Breakout":"Breakout","Avoid":"Avoid"}.get(base, base)
             pretty.append(label); map_pretty[label]=c
         if not pretty:
             st.caption("No tag columns found (FFG_/FFB_).")
@@ -1159,6 +1202,7 @@ with st.expander("🏷️ Quick Tag Editor", expanded=True):  # keep open to avo
             if do_tag and write_ready and not practice:
                 try:
                     ws = sh.worksheet("Players"); df = normalize_cols(ws_to_df(ws))
+                    # ensure column exists in sheet before toggling
                     if tgt_col not in df.columns: df[tgt_col]=""
                     mask = df["Player"].astype(str).eq(tg_player)
                     if not mask.any():
@@ -1173,4 +1217,4 @@ with st.expander("🏷️ Quick Tag Editor", expanded=True):  # keep open to avo
                     st.error(f"Tag update failed: {e}")
 
 # Footer
-st.caption("Auction GM • Teams & Needs • position-aware • optimized for 1920×1080")
+st.caption("Auction GM • Fast draft flow • Teams & Needs • Draft Log & Trends • Best Values • Heatmap • Trap Finder")
