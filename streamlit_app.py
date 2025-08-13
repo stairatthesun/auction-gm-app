@@ -791,11 +791,19 @@ if 'sh' in locals() and write_ready:
         st.error(f"Could not load Players sheet: {e}")
     try:
         league_df = normalize_cols(ws_to_df_cached(SHEET_ID, "League_Teams", SA_JSON))
-        # Guard: My Team must be row 2
-        if not league_df.empty and "team_name" in league_df.columns:
-            if len(league_df) < 2 or str(league_df.loc[league_df.index[1], "team_name"]).strip() != "My Team":
-                st.error("League_Teams row 2 must be 'My Team'. Please fix and reload.")
+        # Guard: My Team must be the first data row (Google Sheets row 2)
+        if not league_df.empty:
+            # Normalize header and values
+            if "team_name" not in league_df.columns:
+                st.error("League_Teams is missing a 'team_name' column (exact header required).")
                 st.stop()
+
+            first_row_idx = league_df.index[0]  # first data row == Google Sheets row 2
+            val = str(league_df.loc[first_row_idx, "team_name"]).strip().lower()
+            if val != "my team":
+                st.error("League_Teams row 2 (first data row) must have team_name = 'My Team'. Please fix and reload.")
+                st.stop()
+
     except Exception:
         league_df = pd.DataFrame()
 
