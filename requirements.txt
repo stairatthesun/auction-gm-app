@@ -3,5 +3,3 @@ pandas>=2.2
 requests>=2.31
 gspread>=6.1.2
 google-auth>=2.29.0
-feedparser==6.0.10
-# trigger rebuild
