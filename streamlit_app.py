@@ -1,19 +1,21 @@
-# streamlit_app.py — v8
-# - Clean UX (spinner+toast), busy-guarded buttons
-# - Practice Mode
-# - Archive & Reset + Reset (No Archive) + optional Purge Archives
-# - Robust Secrets reader (GOOGLE_SERVICE_ACCOUNT_JSON OR [gcp_service_account] table)
-# - Sleeper league header
-# - NEW: Upload raw FFA CSV -> clean & map -> write to Google Sheet "Projections"
+# streamlit_app.py — v9 (all-in-one)
+# - Secrets: robust creds load (string JSON or [gcp_service_account] table)
+# - Modes: Practice + Admin
+# - Admin tools: Upload FFA CSV -> clean -> write Projections; Sync Projections -> Players
+# - Draft controls: Archive & Reset, Reset (No Archive), Purge Archives, Undo Last
+# - Sleeper header
+# - Draft Board UI: search/filters/hide drafted/price entry/drafted toggle
+# - RAV engine: uses AAV > VOR > Points, live market inflation, soft/hard caps
 
 import json
 from datetime import datetime
 import io
+import math
 import pandas as pd
 import requests
 import streamlit as st
 
-# Optional write libs
+# Optional write libs (available on Streamlit Cloud)
 try:
     import gspread
     from google.oauth2.service_account import Credentials
@@ -69,14 +71,27 @@ def _batch_clear(ws, start_row, col_idx, end_row):
     a1 = f"{rowcol_to_a1(start_row, col_idx)}:{rowcol_to_a1(end_row, col_idx)}"
     ws.batch_clear([a1])
 
+def ws_to_df(ws):
+    rows = ws.get_all_values()
+    if not rows:
+        return pd.DataFrame()
+    header, data = rows[0], rows[1:]
+    return pd.DataFrame(data, columns=header)
+
+def write_dataframe_to_sheet(ws, df: pd.DataFrame, header=True):
+    values = [df.columns.tolist()] + df.fillna("").astype(str).values.tolist() if header else df.fillna("").astype(str).values.tolist()
+    ws.batch_clear(["A1:Z100000"])
+    ws.update("A1", values, value_input_option="RAW")
+
+def upsert_worksheet(sh, title, rows=5000, cols=30):
+    try:
+        return sh.worksheet(title)
+    except Exception:
+        sh.add_worksheet(title=title, rows=rows, cols=cols)
+        return sh.worksheet(title)
+
+# Reset + Archive
 def reset_live_fields_only(sh):
-    """
-    Clears live draft fields without creating an archive:
-      - Players: status, drafted_by, price_paid
-      - League_Teams: rows (A2:Z)
-      - Draft_Log: rows (A2:Z)
-      - Phase_Budgets: only columns whose header starts with '(auto)'
-    """
     try:
         # Players
         ws_p = sh.worksheet("Players")
@@ -113,10 +128,6 @@ def reset_live_fields_only(sh):
         return False, f"Reset failed: {e}"
 
 def archive_and_reset(sh):
-    """
-    1) Create Archive_{timestamp} worksheet and copy Draft_Log, League_Teams, Settings_League
-    2) Clear live fields in Players / League_Teams / Draft_Log / Phase_Budgets (auto cols)
-    """
     ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     archive_title = f"Archive_{ts}"
     try:
@@ -143,12 +154,10 @@ def archive_and_reset(sh):
         return False, str(e)
 
     ok, msg = reset_live_fields_only(sh)
-    if not ok:
-        return False, msg
+    if not ok: return False, msg
     return True, f"Archived to {archive_title} and reset live tabs."
 
 def purge_archives(sh, keep_latest=True):
-    """Delete Archive_* worksheets. If keep_latest=True, keeps the newest one."""
     try:
         ws_list = sh.worksheets()
         archives = [ws for ws in ws_list if ws.title.startswith("Archive_")]
@@ -163,23 +172,264 @@ def purge_archives(sh, keep_latest=True):
     except Exception as e:
         return False, f"Purge failed: {e}"
 
-def upsert_worksheet(sh, title, rows=5000, cols=30):
-    """Get worksheet by title or create if missing."""
-    try:
-        return sh.worksheet(title)
-    except Exception:
-        sh.add_worksheet(title=title, rows=rows, cols=cols)
-        return sh.worksheet(title)
+# -------- CSV Import (Admin) --------
+TARGET_PROJ_COLS = [
+    "Position","Player","Team","Points","VOR","ADP","AAV","Rank Overall","Rank Position"
+]
+NAME_MAP = {
+    "position":"Position","pos":"Position",
+    "player":"Player","name":"Player",
+    "team":"Team","tm":"Team",
+    "points":"Points","proj_points":"Points","proj_fp":"Points","fp":"Points","fantasy_points":"Points",
+    "vor":"VOR","points_vor":"VOR","value_over_replacement":"VOR",
+    "adp":"ADP",
+    "aav":"AAV","auction_value":"AAV",
+    "rank":"Rank Overall","overall_rank":"Rank Overall","rank_overall":"Rank Overall",
+    "position_rank":"Rank Position","pos_rank":"Rank Position","rank_position":"Rank Position",
+}
 
-def write_dataframe_to_sheet(ws, df: pd.DataFrame, header=True):
-    """Overwrite entire worksheet area with df (headers + values)."""
-    values = [df.columns.tolist()] + df.fillna("").astype(str).values.tolist() if header else df.fillna("").astype(str).values.tolist()
-    # Clear a big range then write once
-    ws.batch_clear(["A1:Z100000"])
-    ws.update("A1", values, value_input_option="RAW")
+def clean_projection_csv(file_bytes: bytes) -> pd.DataFrame:
+    df = pd.read_csv(io.BytesIO(file_bytes))
+    # map known names
+    col_map = {}
+    for c in df.columns:
+        key = str(c).strip().lower()
+        if key in NAME_MAP:
+            col_map[c] = NAME_MAP[key]
+    df = df.rename(columns=col_map)
+    # ensure required cols
+    for col in TARGET_PROJ_COLS:
+        if col not in df.columns:
+            df[col] = None
+    df = df[TARGET_PROJ_COLS]
+    # types
+    for col in ["Points","VOR","ADP","AAV","Rank Overall","Rank Position"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df["Player"] = df["Player"].astype(str).str.strip()
+    df["Team"] = df["Team"].astype(str).str.strip()
+    df["Position"] = df["Position"].astype(str).str.strip()
+    df = df[df["Player"]!=""].reset_index(drop=True)
+    return df
+
+def left_join_update(base_df, join_df, keys, cols_to_pull):
+    merged = base_df.merge(join_df[keys + cols_to_pull], on=keys, how="left", suffixes=("", "_new"))
+    for c in cols_to_pull:
+        nc = f"{c}_new"
+        if nc in merged.columns:
+            merged[c] = merged[nc].where(merged[nc].notna(), merged.get(c))
+            merged.drop(columns=[nc], inplace=True, errors="ignore")
+    return merged
+
+def sync_projections_to_players(sh):
+    ws_proj = sh.worksheet("Projections")
+    ws_players = sh.worksheet("Players")
+
+    df_p = ws_to_df(ws_players)
+    df_r = ws_to_df(ws_proj)
+
+    for df in (df_p, df_r):
+        for k in ("Player","Team","Position"):
+            if k in df.columns:
+                df[k] = df[k].astype(str).str.strip()
+
+    keys = ["Player","Team","Position"]
+    pull = ["Points","VOR","ADP","AAV","Rank Overall","Rank Position"]
+    for c in pull:
+        if c not in df_r.columns:
+            df_r[c] = pd.NA
+        if c not in df_p.columns:
+            df_p[c] = pd.NA
+
+    out = left_join_update(df_p, df_r, keys, pull)
+    write_dataframe_to_sheet(ws_players, out, header=True)
+    return True, f"Synced {len(df_r):,} projections into Players."
+
+# -------- RAV (Recommended Auction Value) --------
+def compute_recommended_values(df_players: pd.DataFrame, total_budget_per_team=200, teams=14):
+    """
+    Returns df with added columns: soft_rec_$, hard_cap_$, inflation_index
+    Strategy:
+      - base_value = AAV if present else VOR_scaled else Points_scaled
+      - inflation_index = actual_spend_so_far / expected_spend_so_far (safe if 0)
+      - soft_rec_$ = base_value * inflation_adj, clamped >= $1
+      - hard_cap_$ = soft_rec_$ * 1.10 (10% buffer), but not exceeding user's per-roster need heuristic
+    Notes:
+      - This is a league-wide baseline. Your personal team budget constraints are enforced at draft time.
+    """
+    df = df_players.copy()
+
+    # Build expected spend baseline from AAV if available
+    aav = pd.to_numeric(df.get("AAV"), errors="coerce")
+    vor = pd.to_numeric(df.get("VOR"), errors="coerce")
+    pts = pd.to_numeric(df.get("Points"), errors="coerce")
+
+    # Simple scaling for VOR/Points if AAV missing
+    vor_scaled = None
+    pts_scaled = None
+    if vor.notna().sum() > 0:
+        # Scale VOR to typical auction pool (cap at positive VOR)
+        pos_vor = vor.clip(lower=0)
+        total_pos_vor = pos_vor.sum()
+        total_dollars = total_budget_per_team * teams
+        vor_scaled = (pos_vor / total_pos_vor * total_dollars) if total_pos_vor > 0 else pos_vor
+    if pts.notna().sum() > 0 and (vor_scaled is None or vor_scaled.isna().all()):
+        pos_pts = pts.clip(lower=0)
+        total_pos_pts = pos_pts.sum()
+        total_dollars = total_budget_per_team * teams
+        pts_scaled = (pos_pts / total_pos_pts * total_dollars) if total_pos_pts > 0 else pos_pts
+
+    # Choose base
+    base = aav
+    if base.isna().all() and vor_scaled is not None:
+        base = vor_scaled
+    if base.isna().all() and pts_scaled is not None:
+        base = pts_scaled
+
+    # Inflation index requires actual spend so far:
+    # Expect the sheet to have price_paid in Players; if not, infer 0.
+    actual_spend = pd.to_numeric(df.get("price_paid"), errors="coerce").fillna(0).sum()
+    # expected spend so far: sum of base for drafted players
+    drafted_mask = df.get("status", "").astype(str).str.lower().eq("drafted")
+    if drafted_mask.any():
+        expected_spend_so_far = base.where(drafted_mask, 0).sum(skipna=True)
+    else:
+        expected_spend_so_far = 0.0
+    inflation_index = 1.0
+    if expected_spend_so_far and expected_spend_so_far > 0:
+        inflation_index = max(0.75, min(1.5, actual_spend / expected_spend_so_far))
+
+    # Compute soft/hard
+    soft = (base * inflation_index).fillna(0)
+    soft = soft.clip(lower=1).round(0)
+
+    hard = (soft * 1.10).round(0)
+
+    out = df.copy()
+    out["(auto) inflation_index"] = inflation_index
+    out["soft_rec_$"] = soft
+    out["hard_cap_$"] = hard
+    return out
+
+def write_recommendations_to_players(sh):
+    ws_players = sh.worksheet("Players")
+    df_p = ws_to_df(ws_players)
+
+    # Ensure required cols exist
+    for c in ["AAV","VOR","Points","status","price_paid"]:
+        if c not in df_p.columns:
+            df_p[c] = ""
+
+    df_out = compute_recommended_values(df_p)
+    # Merge only rec cols back
+    cols_keep = list(df_p.columns)
+    df_merge = df_p.merge(
+        df_out[["Player","Team","Position","(auto) inflation_index","soft_rec_$","hard_cap_$"]],
+        on=["Player","Team","Position"], how="left", suffixes=("","_new")
+    )
+    for c in ["(auto) inflation_index","soft_rec_$","hard_cap_$"]:
+        if f"{c}_new" in df_merge.columns:
+            df_merge[c] = df_merge[f"{c}_new"]
+            df_merge.drop(columns=[f"{c}_new"], inplace=True, errors="ignore")
+
+    write_dataframe_to_sheet(ws_players, df_merge, header=True)
+    return True, "Recommendations updated (soft/hard + inflation)."
+
+# -------- Draft Actions --------
+def append_draft_log(sh, row: dict):
+    ws = sh.worksheet("Draft_Log")
+    header = ws.row_values(1)
+    # ensure header
+    needed = ["timestamp","player","team","position","manager","price","note"]
+    if not header:
+        ws.update("A1", [needed])
+        header = needed
+    # align row
+    out = []
+    for c in header:
+        out.append(row.get(c,""))
+    ws.append_row(out, value_input_option="RAW")
+
+def update_player_drafted(sh, player_key, manager, price):
+    # player_key is (Player, Team, Position)
+    ws = sh.worksheet("Players")
+    df = ws_to_df(ws)
+    for k in ("Player","Team","Position"):
+        if k not in df.columns:
+            raise RuntimeError(f"Players sheet missing column: {k}")
+    mask = (df["Player"]==player_key[0]) & (df["Team"]==player_key[1]) & (df["Position"]==player_key[2])
+    if not mask.any():
+        raise RuntimeError("Player not found in Players sheet.")
+    idx = df.index[mask][0]
+    # create columns if missing
+    for c in ["status","drafted_by","price_paid"]:
+        if c not in df.columns:
+            df[c] = ""
+    df.loc[idx, "status"] = "drafted"
+    df.loc[idx, "drafted_by"] = manager
+    df.loc[idx, "price_paid"] = str(int(price)) if pd.notna(price) and price != "" else ""
+
+    write_dataframe_to_sheet(ws, df, header=True)
+    return True
+
+def update_league_team_budget(sh, manager, price, delta_roster=1):
+    ws = sh.worksheet("League_Teams")
+    df = ws_to_df(ws)
+    # expected cols: team_name, budget_remaining, roster_spots_open (at least)
+    for c in ["team_name","budget_remaining","roster_spots_open"]:
+        if c not in df.columns:
+            return False, "League_Teams sheet missing columns team_name/budget_remaining/roster_spots_open."
+    # normalize name
+    df["team_name"] = df["team_name"].astype(str)
+    m = df["team_name"].str.strip().str.lower() == str(manager).strip().lower()
+    if not m.any():
+        return False, f"Manager '{manager}' not found in League_Teams."
+    i = df.index[m][0]
+    # update budget & roster
+    try:
+        b = pd.to_numeric(df.at[i, "budget_remaining"], errors="coerce")
+        b = 0 if pd.isna(b) else b
+        price = float(price)
+        df.at[i, "budget_remaining"] = max(0, b - price)
+    except Exception:
+        pass
+    try:
+        r = pd.to_numeric(df.at[i, "roster_spots_open"], errors="coerce")
+        r = 0 if pd.isna(r) else r
+        df.at[i, "roster_spots_open"] = max(0, r - delta_roster)
+    except Exception:
+        pass
+    write_dataframe_to_sheet(ws, df, header=True)
+    return True, "Budget/roster updated."
+
+def undo_last_pick(sh):
+    ws_log = sh.worksheet("Draft_Log")
+    rows = ws_log.get_all_values()
+    if len(rows) <= 1:
+        return False, "No picks to undo."
+    header, data = rows[0], rows[1:]
+    last = data[-1]
+    rec = dict(zip(header, last))
+    # Rollback player
+    ws_p = sh.worksheet("Players")
+    df = ws_to_df(ws_p)
+    mask = (df["Player"]==rec.get("player")) & (df["Team"]==rec.get("team")) & (df["Position"]==rec.get("position"))
+    if mask.any():
+        idx = df.index[mask][0]
+        for c in ["status","drafted_by","price_paid"]:
+            if c not in df.columns: df[c] = ""
+        df.loc[idx, ["status","drafted_by","price_paid"]] = ["","",""]
+        write_dataframe_to_sheet(ws_p, df, header=True)
+    # Rollback team budget
+    try:
+        update_league_team_budget(sh, rec.get("manager",""), -float(rec.get("price","0")), delta_roster=-1)
+    except Exception:
+        pass
+    # Delete last log row
+    ws_log.delete_rows(len(data)+1)
+    return True, f"Undid last pick: {rec.get('player')} for ${rec.get('price')}."
 
 # ------------- UI -------------
-st.title("🏈 Auction GM — v8")
+st.title("🏈 Auction GM — v9")
 
 # Sidebar: connection + modes
 with st.sidebar:
@@ -204,11 +454,12 @@ with st.sidebar:
             if sa_email:
                 st.caption(f"Shared with: {sa_email}")
     else:
-        st.info("Write features (Archive/Reset) are optional. Add GOOGLE_SERVICE_ACCOUNT_JSON in Secrets and share your Sheet with that service account to enable them.")
+        st.info("Write features are optional. Add GOOGLE_SERVICE_ACCOUNT_JSON in Secrets and share your Sheet with that service account to enable them.")
 
     st.divider()
-    st.header("Practice Mode")
-    practice = st.toggle("Enable Practice Mode (no writes; safe sandbox)", value=True)
+    st.header("Modes")
+    practice = st.toggle("Practice Mode (no writes)", value=True)
+    admin_mode = st.toggle("Admin Mode (show admin tools)", value=False)
 
     st.divider()
     st.header("Draft Controls")
@@ -251,6 +502,38 @@ with st.sidebar:
         finally:
             st.session_state["busy"] = False
 
+    # Data Actions
+    st.divider()
+    st.header("Data Actions")
+    btn_sync = st.button("🔄 Sync Projections → Players", use_container_width=True, disabled=not (write_ready and not practice))
+    if btn_sync and write_ready and not practice and not st.session_state["busy"]:
+        st.session_state["busy"] = True
+        try:
+            with st.spinner("Syncing projections into Players…"):
+                ok, msg = sync_projections_to_players(sh)
+            st.toast(msg if ok else f"⚠️ {msg}")
+        finally:
+            st.session_state["busy"] = False
+
+    btn_recs = st.button("💡 Recompute Recommended $", use_container_width=True, disabled=not (write_ready and not practice))
+    if btn_recs and write_ready and not practice and not st.session_state["busy"]:
+        st.session_state["busy"] = True
+        try:
+            with st.spinner("Computing RAV soft/hard and inflation…"):
+                ok, msg = write_recommendations_to_players(sh)
+            st.toast(msg if ok else f"⚠️ {msg}")
+        finally:
+            st.session_state["busy"] = False
+
+    btn_undo = st.button("↩️ Undo Last Pick", use_container_width=True, disabled=not (write_ready and not practice))
+    if btn_undo and write_ready and not practice and not st.session_state["busy"]:
+        st.session_state["busy"] = True
+        try:
+            ok, msg = undo_last_pick(sh)
+            st.toast(msg if ok else f"⚠️ {msg}")
+        finally:
+            st.session_state["busy"] = False
+
 # League header (Sleeper)
 col1, col2, col3 = st.columns(3)
 if SLEEPER_LEAGUE_ID:
@@ -266,104 +549,135 @@ else:
 
 st.divider()
 
-# ------------- NEW: FFA CSV Upload -> Clean -> Write to Sheet -------------
-st.subheader("📥 Import Projections (Raw FFA CSV → Projections sheet)")
-
-st.caption("Upload the unedited CSV from FFA Season Projections. The app will drop unneeded columns, rename to the expected schema, and write it to the 'Projections' tab in your backend.")
-
-uploaded = st.file_uploader("Upload FFA CSV", type=["csv"], accept_multiple_files=False)
-
-# Desired output schema and canonical order
-target_cols = [
-    "Position",
-    "Player",
-    "Team",
-    "Points",
-    "VOR",
-    "ADP",
-    "AAV",
-    "Rank Overall",
-    "Rank Position",
-]
-
-# Flexible column name mapping (lowercased keys)
-name_map = {
-    "position": "Position",
-    "pos": "Position",
-    "player": "Player",
-    "name": "Player",
-    "team": "Team",
-    "tm": "Team",
-    "points": "Points",
-    "proj_points": "Points",
-    "proj_fp": "Points",
-    "fp": "Points",
-    "vor": "VOR",
-    "points_vor": "VOR",
-    "value_over_replacement": "VOR",
-    "adp": "ADP",
-    "aav": "AAV",
-    "auction_value": "AAV",
-    "rank": "Rank Overall",
-    "overall_rank": "Rank Overall",
-    "rank_overall": "Rank Overall",
-    "position_rank": "Rank Position",
-    "pos_rank": "Rank Position",
-    "rank_position": "Rank Position",
-}
-
-def clean_projection_csv(file_bytes: bytes) -> pd.DataFrame:
-    df = pd.read_csv(io.BytesIO(file_bytes))
-    # Build a mapping from existing columns -> target names
-    col_map = {}
-    for c in df.columns:
-        key = str(c).strip().lower()
-        if key in name_map:
-            col_map[c] = name_map[key]
-    df = df.rename(columns=col_map)
-
-    # Keep only target columns; create missing ones empty
-    for col in target_cols:
-        if col not in df.columns:
-            df[col] = None
-    df = df[target_cols]
-
-    # Coerce numeric fields
-    for col in ["Points", "VOR", "ADP", "AAV", "Rank Overall", "Rank Position"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    # Drop rows with no player name
-    df = df[df["Player"].notna() & (df["Player"].astype(str).str.strip() != "")]
-    df = df.reset_index(drop=True)
-    return df
-
-if uploaded is not None:
-    try:
-        with st.spinner("Parsing and cleaning CSV…"):
-            cleaned = clean_projection_csv(uploaded.read())
-        st.success(f"Loaded {len(cleaned):,} players. Preview below:")
-        st.dataframe(cleaned.head(20), use_container_width=True)
-        st.caption("Columns ↓ match the backend schema exactly:")
-        st.code(", ".join(cleaned.columns.tolist()))
-        can_write = write_ready and not practice
-        btn = st.button("✍️ Write to Google Sheet → 'Projections'", type="primary", disabled=not can_write)
-        if btn:
-            if not write_ready:
-                st.toast("⚠️ Write access not enabled.")
-            elif practice:
-                st.toast("ℹ️ Turn off Practice Mode to write to the sheet.")
-            else:
-                try:
-                    with st.spinner("Writing cleaned data to 'Projections'…"):
-                        ws_proj = upsert_worksheet(sh, "Projections", rows=max(5000, len(cleaned)+10), cols=len(target_cols)+3)
-                        write_dataframe_to_sheet(ws_proj, cleaned, header=True)
-                    st.toast("✅ Projections updated in Google Sheet.")
-                except Exception as e:
-                    st.error(f"Write failed: {e}")
-    except Exception as e:
-        st.error(f"Could not read CSV: {e}")
+# -------- Admin: CSV Import (hidden unless Admin Mode) --------
+if write_ready and admin_mode:
+    st.subheader("📥 Admin • Import Projections")
+    with st.expander("Upload raw FFA CSV (click to open)", expanded=False):
+        st.caption("Upload the unedited CSV from FFA Season Projections. It will be cleaned and written to the 'Projections' tab.")
+        uploaded = st.file_uploader("Upload FFA CSV", type=["csv"], accept_multiple_files=False)
+        if uploaded is not None:
+            try:
+                with st.spinner("Parsing and cleaning CSV…"):
+                    cleaned = clean_projection_csv(uploaded.read())
+                st.success(f"Loaded {len(cleaned):,} players. Preview below:")
+                st.dataframe(cleaned.head(20), use_container_width=True)
+                st.caption("Columns ↓ match the backend schema exactly:")
+                st.code(", ".join(cleaned.columns.tolist()))
+                can_write = write_ready and not practice
+                btn_write = st.button("✍️ Write to Google Sheet → 'Projections'", type="primary", disabled=not can_write)
+                if btn_write:
+                    try:
+                        with st.spinner("Writing cleaned data to 'Projections'…"):
+                            ws_proj = upsert_worksheet(sh, "Projections", rows=max(5000, len(cleaned)+10), cols=len(TARGET_PROJ_COLS)+3)
+                            write_dataframe_to_sheet(ws_proj, cleaned, header=True)
+                        st.toast("✅ Projections updated in Google Sheet.")
+                    except Exception as e:
+                        st.error(f"Write failed: {e}")
+            except Exception as e:
+                st.error(f"Could not read CSV: {e}")
 
 st.divider()
-st.subheader("Players — Draft Board (coming next)")
-st.write("Next update wires the Players table (search/filters/drafted/price) and shows Soft/Hard Recommended $ computed from these projections plus your league context.")
-st.caption("Tip: Keep Practice Mode ON for safe testing; toggle OFF only when you’re ready to write.")
+
+# -------- Draft Board UI --------
+st.subheader("📋 Draft Board")
+
+players_df = pd.DataFrame()
+if write_ready:
+    try:
+        ws_p = sh.worksheet("Players")
+        players_df = ws_to_df(ws_p)
+    except Exception as e:
+        st.error(f"Could not load Players sheet: {e}")
+
+if not players_df.empty:
+    # Normalize types and missing columns
+    for c in ["Points","VOR","ADP","AAV","soft_rec_$","hard_cap_$","price_paid"]:
+        if c not in players_df.columns:
+            players_df[c] = ""
+        players_df[c] = pd.to_numeric(players_df[c], errors="coerce")
+    for c in ["status","drafted_by"]:
+        if c not in players_df.columns:
+            players_df[c] = ""
+
+    # Filters row
+    f1, f2, f3, f4, f5 = st.columns([2,1,1,1,1])
+    with f1:
+        q = st.text_input("Search name", "")
+    with f2:
+        pos_opts = sorted(players_df["Position"].dropna().unique().tolist())
+        pos_sel = st.multiselect("Positions", pos_opts, default=[])
+    with f3:
+        team_opts = sorted(players_df["Team"].dropna().unique().tolist())
+        team_sel = st.multiselect("Teams", team_opts, default=[])
+    with f4:
+        hide_drafted = st.toggle("Hide drafted", value=True)
+    with f5:
+        sort_by = st.selectbox("Sort by", ["Rank Overall","soft_rec_$","AAV","VOR","Points","ADP"], index=0)
+
+    view = players_df.copy()
+
+    # Apply filters
+    if q:
+        view = view[view["Player"].str.contains(q, case=False, na=False)]
+    if pos_sel:
+        view = view[view["Position"].isin(pos_sel)]
+    if team_sel:
+        view = view[view["Team"].isin(team_sel)]
+    if hide_drafted:
+        view = view[~view["status"].astype(str).str.lower().eq("drafted")]
+
+    # Sort
+    if sort_by in view.columns:
+        # For ranks, lower is better; others higher is better
+        ascending = sort_by in ["Rank Overall","ADP","Rank Position"]
+        view = view.sort_values(by=sort_by, ascending=ascending, na_position="last")
+    else:
+        view = view.sort_values(by="Rank Overall", ascending=True, na_position="last")
+
+    # Display limited columns for clarity
+    show_cols = ["Position","Player","Team","soft_rec_$","hard_cap_$","AAV","VOR","Points","ADP","Rank Overall","status","drafted_by","price_paid"]
+    for c in show_cols:
+        if c not in view.columns:
+            view[c] = ""
+    st.dataframe(view[show_cols], use_container_width=True, height=520)
+
+    st.markdown("### 📝 Draft a Player")
+    c1, c2, c3, c4, c5 = st.columns([2,1.5,1.5,1,1.5])
+    with c1:
+        sel_name = st.selectbox("Player", players_df["Player"].tolist())
+    with c2:
+        sel_team = st.selectbox("Team", sorted(players_df.loc[players_df["Player"]==sel_name, "Team"].unique().tolist()))
+    with c3:
+        sel_pos  = st.selectbox("Position", sorted(players_df.loc[players_df["Player"]==sel_name, "Position"].unique().tolist()))
+    with c4:
+        sel_price = st.number_input("Price", min_value=1, max_value=500, step=1, value=1)
+    with c5:
+        sel_mgr = st.text_input("Manager", "")
+
+    draft_btn = st.button("✅ Mark Drafted & Log", type="primary", disabled=not (write_ready and not practice))
+    if draft_btn and write_ready and not practice and not st.session_state.get("busy", False):
+        st.session_state["busy"] = True
+        try:
+            # Update player row
+            ok = update_player_drafted(sh, (sel_name, sel_team, sel_pos), sel_mgr, sel_price)
+            # Append log
+            append_draft_log(sh, {
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+                "player": sel_name,
+                "team": sel_team,
+                "position": sel_pos,
+                "manager": sel_mgr,
+                "price": str(int(sel_price)),
+                "note": "",
+            })
+            # Update team budget
+            update_league_team_budget(sh, sel_mgr, sel_price, delta_roster=1)
+            # Recompute recommendations (market inflation)
+            write_recommendations_to_players(sh)
+            st.toast(f"Drafted {sel_name} ({sel_pos} {sel_team}) for ${sel_price}.")
+        except Exception as e:
+            st.error(f"Draft failed: {e}")
+        finally:
+            st.session_state["busy"] = False
+else:
+    st.info("Players sheet is empty or unavailable. Use Admin → Sync Projections → Players first.")
