@@ -470,50 +470,72 @@ def update_player_drafted(sh, player_key, manager, price):
 
 # --------------------------- Nomination Recs (position-aware) ---------------------------
 def build_nomination_list(players_df: pd.DataFrame, league_df: pd.DataFrame, top_n: int = 8):
-    df = players_df.copy()
+    # Defensive copy
+    df = players_df.copy() if players_df is not None else pd.DataFrame()
+
+    # Ensure columns exist (avoid KeyError)
+    needed_cols = ["status","Position","Player","Team","soft_rec_$","AAV","ADP","VOR","Points","Rank Position"]
+    for c in needed_cols:
+        if c not in df.columns:
+            df[c] = "" if c not in ("soft_rec_$","AAV","ADP","VOR","Points","Rank Position") else float("nan")
+
+    # Filter out drafted safely
     df = df[~df["status"].astype(str).str.lower().eq("drafted")].copy()
 
-    # numeric columns
+    # Coerce numerics
     for c in ["soft_rec_$","AAV","ADP","VOR","Points","Rank Position"]:
-        if c in df.columns: df[c] = pd.to_numeric(df[c], errors="coerce")
+        df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    # baseline market value
-    base_val = df["AAV"] if "AAV" in df.columns else pd.Series([float("nan")]*len(df))
+    # If empty after filtering, return empty frames
+    if df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    # Baseline market value (fallback if AAV missing)
+    base_val = df["AAV"].copy()
     if base_val.isna().all():
-        base_val = (pd.to_numeric(df.get("soft_rec_$", pd.Series([0]*len(df))), errors="coerce") / 1.15)
+        base_val = (df["soft_rec_$"] / 1.15)
 
-    df["value_surplus"] = pd.to_numeric(df.get("soft_rec_$",0), errors="coerce") - pd.to_numeric(base_val, errors="coerce")
+    df["value_surplus"] = df["soft_rec_$"] - base_val
 
     # Position supply (remaining)
     pos_list = df["Position"].dropna().unique().tolist()
-    pos_supply = {p: max(1, df[df["Position"]==p].shape[0]) for p in pos_list}
+    pos_supply = {p: max(1, int((df["Position"] == p).sum())) for p in pos_list}
 
     # Position demand from League_Teams (sum of open_* cols)
     scarcity = {}
-    if not league_df.empty:
+    if league_df is not None and not league_df.empty:
         open_map = detect_open_cols(league_df)
         if open_map:
-            # sum needs per position; FLEX contributes 1/3 to RB, WR, TE
-            flex_total = int(pd.to_numeric(league_df.get(open_map.get("FLEX",""), pd.Series([0])).fillna(0)).sum()) if "FLEX" in open_map else 0
+            # Sum needs per position; FLEX contributes fractionally to RB/WR/TE
+            flex_total = 0
+            if "FLEX" in open_map:
+                flex_total = pd.to_numeric(league_df.get(open_map["FLEX"]), errors="coerce").fillna(0).sum()
             for p in pos_list:
-                base_need = int(pd.to_numeric(league_df.get(open_map.get(p,""), pd.Series([0])).fillna(0)).sum()) if p in open_map else 0
-                extra = int(round(flex_total/3)) if p in ("RB","WR","TE") else 0
-                scarcity[p] = max(0, base_need + extra)
+                base_need = 0
+                if p in open_map:
+                    base_need = pd.to_numeric(league_df.get(open_map[p]), errors="coerce").fillna(0).sum()
+                extra = round(flex_total / 3) if p in ("RB","WR","TE") else 0
+                scarcity[p] = max(0, int(base_need) + int(extra))
 
-    # scarcity factor (need/supply)
-    df["scarcity_factor"] = df["Position"].map(lambda p: (scarcity.get(p,0) / max(1, pos_supply.get(p,1))) if pos_supply else 0)
+    # Scarcity factor (need/supply); default 0 if unknown
+    def sca(p):
+        need = scarcity.get(p, 0)
+        sup  = max(1, pos_supply.get(p, 1))
+        return float(need) / float(sup)
 
-    # outbid pressure proxy
+    df["scarcity_factor"] = df["Position"].map(sca).fillna(0.0)
+
+    # Outbid count: teams that both have budget and a relevant opening
     outbid_counts = []
-    if not league_df.empty:
+    if league_df is not None and not league_df.empty and "budget_remaining" in league_df.columns:
         open_map = detect_open_cols(league_df)
         for _, r in df.iterrows():
-            price = r.get("soft_rec_$", 1)
+            price = r.get("soft_rec_$")
             pos   = r.get("Position","")
             cnt = 0
             for _, t in league_df.iterrows():
                 br = pd.to_numeric(t.get("budget_remaining",""), errors="coerce")
-                if pd.isna(br) or br < price: 
+                if pd.isna(price) or pd.isna(br) or br < price:
                     continue
                 if open_map and not has_slot_for_position(t, pos, open_map):
                     continue
@@ -521,16 +543,18 @@ def build_nomination_list(players_df: pd.DataFrame, league_df: pd.DataFrame, top
             outbid_counts.append(cnt)
     df["outbid_count"] = outbid_counts if outbid_counts else 0
 
-    # score
-    val_surplus = (df["value_surplus"] - df["value_surplus"].median(skipna=True)).fillna(0)
-    scarcity_norm = (df["scarcity_factor"] - df["scarcity_factor"].median(skipna=True)).fillna(0)
-    outbid_norm = (df["outbid_count"] - df["outbid_count"].median(skipna=True)).fillna(0)
+    # Scoring
+    val_surplus  = (df["value_surplus"]  - df["value_surplus"].median(skipna=True)).fillna(0)
+    scarcity_norm= (df["scarcity_factor"]- df["scarcity_factor"].median(skipna=True)).fillna(0)
+    outbid_norm  = (df["outbid_count"]  - df["outbid_count"].median(skipna=True)).fillna(0)
     rp = pd.to_numeric(df.get("Rank Position"), errors="coerce")
-    rp_inv = (-rp.fillna(rp.max() or 999)).fillna(0)
+    rp_inv = (-rp.fillna(rp.max() if rp.notna().any() else 999)).fillna(0)
+
     df["nom_score"] = 0.45*val_surplus + 0.30*scarcity_norm + 0.15*outbid_norm + 0.10*rp_inv
 
+    # Output tables
     value_targets = df.sort_values(["nom_score"], ascending=False).head(top_n).copy()
-    enforcers = df.sort_values(["outbid_count","scarcity_factor"], ascending=[False,False]).head(top_n).copy()
+    enforcers    = df.sort_values(["outbid_count","scarcity_factor"], ascending=[False,False]).head(top_n).copy()
 
     def reason(row):
         parts=[]
@@ -538,11 +562,14 @@ def build_nomination_list(players_df: pd.DataFrame, league_df: pd.DataFrame, top
         if pd.notna(row.get("scarcity_factor")) and row["scarcity_factor"]>0.5: parts.append("scarce pos")
         if pd.notna(row.get("outbid_count")) and row["outbid_count"]>=3: parts.append(f"{int(row['outbid_count'])} can outbid")
         return " • ".join(parts) if parts else "balanced"
-    for df_ in (value_targets, enforcers):
-        if not df_.empty:
-            df_["why"] = df_.apply(reason, axis=1)
+
+    if not value_targets.empty:
+        value_targets["why"] = value_targets.apply(reason, axis=1)
+    if not enforcers.empty:
+        enforcers["why"] = enforcers.apply(reason, axis=1)
 
     return value_targets, enforcers
+
 
 # --------------------------- UI ---------------------------
 st.title("🏈 Auction GM")
@@ -633,6 +660,17 @@ if 'sh' in locals() and write_ready:
         league_df = normalize_cols(ws_to_df_cached(SHEET_ID, "League_Teams", SA_JSON))
     except Exception:
         league_df = pd.DataFrame()
+		
+# --- Safety net: ensure required columns exist to avoid KeyError downstream
+if players_df is None or players_df.empty:
+    players_df = pd.DataFrame()
+
+for c in ["status","Position","Player","Team","soft_rec_$","AAV","ADP","VOR","Points","Rank Overall","Rank Position"]:
+    if c not in players_df.columns:
+        players_df[c] = (
+            float("nan") if c in ("soft_rec_$","AAV","ADP","VOR","Points","Rank Overall","Rank Position")
+            else ""
+        )
 
 # --------------------------- Top controls: Draft + Price-check ---------------------------
 st.divider()
