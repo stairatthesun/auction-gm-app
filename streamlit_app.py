@@ -393,7 +393,7 @@ def recompute_maxbid_and_pps(row, open_map):
     # max_bid = budget_remaining - max(0, total_open - 1)
     b = float(pd.to_numeric(row.get("budget_remaining",0), errors="coerce") or 0)
     total = total_open_slots(row, open_map)
-    max_bid = int(max(0, round(b - max(0, total - 1)))))
+    max_bid = int(max(0, round(b - max(0, total - 1))))
     # (auto)_$per_open_slot = budget_remaining / total_open (rounded)
     pps = int(round(b / total)) if total>0 else int(b)
     return max_bid, pps
