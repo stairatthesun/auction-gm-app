@@ -1,12 +1,14 @@
-# streamlit_app.py — Auction GM (FINAL compact build)
-# Features:
-# - Draft from board (checkbox + confirm form). No top draft panel.
-# - Immediate UI refresh after any write (clear cache + rerun).
-# - Phase Budgets above filters, collapsible.
-# - Tag editor always works (auto-creates FFG_/FFB_ columns if missing).
-# - Admin: Import Projections CSV (replace/append), Smart Sync, Recompute $, Reset, Reset & Archive.
-# - Position-aware price-check & nomination recs using League_Teams open_* per position.
-# - Safe numeric coercion, IDP strip, de-dup, integer writes for budgets/slots.
+# streamlit_app.py — Auction GM (FINAL)
+# Key features:
+# - Draft from the board (small checkbox + confirm form)
+# - Reliable writes via session_state "pending_draft" (fixes confirm timing)
+# - Instant refresh after writes (clear cache + rerun)
+# - Phase Budgets ABOVE filters (collapsible)
+# - Tag editor always works (auto-creates FFG_/FFB_ columns if missing)
+# - Admin: Import Projections CSV (replace/append), Smart Sync, Recompute $, Reset, Reset & Archive
+# - Position-aware recs & nomination logic using League_Teams open_* per position
+# - IDP stripped, de-dup’d, safe numerics everywhere
+# - Compact 1080p-friendly layout
 
 import io, json
 from datetime import datetime
@@ -24,7 +26,6 @@ except Exception:
     Credentials = None
 
 st.set_page_config(page_title="Auction GM", layout="wide")
-
 
 # --------------------------- Secrets / Config ---------------------------
 SHEET_ID = st.secrets.get("SHEET_ID", "")
@@ -59,7 +60,6 @@ CANON = {
 IDENTITY_COLS = ["Player","Team","Position"]
 PROJ_COLS = ["Points","VOR","ADP","AAV","Rank Overall","Rank Position"]
 POS_KEYS = ["QB","RB","WR","TE","FLEX","K","DST","BENCH"]
-
 
 # --------------------------- Utilities ---------------------------
 def normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
@@ -109,6 +109,12 @@ def safe_int_or(v, default=1):
     except Exception:
         return default
 
+def set_pending_draft(row_dict: dict | None):
+    """Store or clear the pending draft (survives reruns)."""
+    if row_dict is None:
+        st.session_state.pop("pending_draft", None)
+    else:
+        st.session_state["pending_draft"] = row_dict
 
 # --------------------------- Sleeper (mini header) ---------------------------
 @st.cache_data(ttl=300)
@@ -117,7 +123,6 @@ def sleeper_get(path):
     r = requests.get(url, timeout=15)
     r.raise_for_status()
     return r.json()
-
 
 # --------------------------- Google Sheets helpers ---------------------------
 def service_account_client(json_str: str, sheet_id: str):
@@ -176,7 +181,6 @@ def upsert_worksheet(sh, title, rows=5000, cols=60):
         sh.add_worksheet(title=title, rows=rows, cols=cols)
         return sh.worksheet(title)
 
-
 # --------------------------- Projections Import ---------------------------
 TARGET_PROJ_COLS = ["Position","Player","Team","Points","VOR","ADP","AAV","Rank Overall","Rank Position"]
 NAME_MAP = {
@@ -215,7 +219,6 @@ def clean_projection_csv(file_bytes: bytes) -> pd.DataFrame:
     # de-dup
     df = df.drop_duplicates(subset=["Player","Team","Position"], keep="first")
     return df
-
 
 # --------------------------- Smart Sync (Projections → Players) ---------------------------
 def smart_sync_projections_to_players(sh, preserve_tags=True, update_identity=False):
@@ -373,7 +376,6 @@ def write_recommendations_to_players(sh, teams=14, budget=200):
     write_dataframe_to_sheet(ws, merged, header=True)
     return True, "Recommendations updated."
 
-
 # --------------------------- League_Teams helpers (per-position) ---------------------------
 def detect_open_cols(df_league: pd.DataFrame):
     # returns dict like {"QB":"open_QB", ...} if found
@@ -474,7 +476,6 @@ def update_league_team_after_pick(sh, team_name, position, price):
     write_dataframe_to_sheet(ws, df, header=True)
     return True, "Team updated."
 
-
 # --------------------------- Draft Updates ---------------------------
 def append_draft_log(sh, row: dict):
     ws = upsert_worksheet(sh, "Draft_Log")
@@ -501,7 +502,6 @@ def update_player_drafted(sh, player_key, manager, price):
     write_dataframe_to_sheet(ws, df, header=True)
     return True
 
-
 # --------------------------- Reset & Archive ---------------------------
 def reset_players_and_league(sh):
     """Soft reset. Players: clear drafted fields. League_Teams: try to reset budgets/slots if hints exist."""
@@ -526,7 +526,7 @@ def reset_players_and_league(sh):
             # Budget reset: prefer 'budget_start' if present; else Settings_League 'budget'
             budget_val = None
             if "budget_start" in df.columns:
-                ser = pd.to_numeric(df["budget_start"], errors="coerce"); 
+                ser = pd.to_numeric(df["budget_start"], errors="coerce")
                 if ser.notna().any(): budget_val = int(ser.dropna().iloc[0])
             if budget_val is None:
                 try:
@@ -578,7 +578,6 @@ def archive_current_state(sh):
     except Exception as e:
         return False, f"Archive League_Teams failed: {e}"
     return True, f"Archived to Archive_Players_{ts} & Archive_League_{ts}."
-
 
 # --------------------------- Nomination Recs (position-aware) ---------------------------
 def build_nomination_list(players_df: pd.DataFrame, league_df: pd.DataFrame, top_n: int = 8):
@@ -676,7 +675,6 @@ def build_nomination_list(players_df: pd.DataFrame, league_df: pd.DataFrame, top
         enforcers["why"] = enforcers.apply(reason, axis=1)
 
     return value_targets, enforcers
-
 
 # --------------------------- UI ---------------------------
 st.title("🏈 Auction GM")
@@ -920,48 +918,90 @@ else:
         },
     )
 
+    # ---- Draft selection + pending draft flow (robust across reruns) ----
     sel = edited[edited["Draft"] == True]
-    c1, c2, c3 = st.columns([1,1,6])
+
+    c1, c2, _ = st.columns([1,1,6])
     with c1:
-        do_draft = st.button("✅ Draft Selected", type="primary", use_container_width=True, disabled=not (len(sel)==1 and write_ready and not practice))
+        do_draft = st.button(
+            "✅ Draft Selected",
+            type="primary",
+            use_container_width=True,
+            disabled=not (len(sel)==1 and write_ready and not practice),
+            key="btn_draft_selected"
+        )
     with c2:
-        if st.button("✖️ Clear Picks", use_container_width=True):
+        if st.button("✖️ Clear Picks", use_container_width=True, key="btn_clear_picks"):
             st.cache_data.clear(); st.rerun()
 
-    # Compact confirm form when exactly one is selected
-    if do_draft and len(sel)==1 and write_ready and not practice:
+    # If user clicked the button, stash the selected row in session and rerun
+    if do_draft and len(sel) == 1 and write_ready and not practice:
         row = sel.iloc[0]
-        st.info(f"Drafting **{row['Player']}** ({row['Position']} · {row['Team']})")
-        with st.form(key=f"confirm_draft_form_{row.name}", clear_on_submit=True):
+        set_pending_draft({
+            "player": str(row["Player"]),
+            "team": str(row["Team"]),
+            "pos": str(row["Position"]),
+            "soft": safe_int_or(row.get("soft_rec_$"), default=1)
+        })
+        st.rerun()
+
+    # Always render the confirm form if a pending draft exists in session
+    if "pending_draft" in st.session_state:
+        pdraft = st.session_state["pending_draft"]
+        st.info(f"Drafting **{pdraft['player']}** ({pdraft['pos']} · {pdraft['team']})")
+
+        with st.form(key="confirm_draft_form", clear_on_submit=False):
             # Team options
             mgr_opts = []
             if not league_df.empty and "team_name" in league_df.columns:
                 mgr_opts = sorted([t for t in league_df["team_name"].dropna().astype(str).tolist() if t])
-            price_val = safe_int_or(row.get("soft_rec_$"), default=1)
-            price = st.number_input("Price", min_value=1, max_value=500, step=1, value=price_val, key=f"board_price_{row.name}")
-            mgr = st.selectbox("Team (buyer)", mgr_opts if mgr_opts else [""], key=f"board_mgr_{row.name}")
+
+            price = st.number_input(
+                "Price", min_value=1, max_value=500, step=1, value=int(pdraft["soft"]),
+                key="confirm_price"
+            )
+            mgr = st.selectbox(
+                "Team (buyer)", mgr_opts if mgr_opts else [""],
+                index=0 if mgr_opts else 0, key="confirm_mgr"
+            )
+
             colF1, colF2 = st.columns([1,1])
-            confirm = colF1.form_submit_button("Confirm Draft", type="primary")
+            confirm = colF1.form_submit_button("Confirm Draft", type="primary", disabled=not (write_ready and not practice))
             cancel  = colF2.form_submit_button("Cancel")
+
         if cancel:
-            st.experimental_rerun()
+            set_pending_draft(None)
+            st.rerun()
+
         if confirm:
             try:
-                update_player_drafted(sh, (row["Player"], row["Team"], row["Position"]), mgr, price)
+                # Write to Players
+                update_player_drafted(
+                    sh,
+                    (pdraft["player"], pdraft["team"], pdraft["pos"]),
+                    mgr,
+                    safe_int_or(price, default=1)
+                )
+                # Log
                 append_draft_log(sh, {
                     "timestamp": datetime.now().isoformat(timespec="seconds"),
-                    "player": row["Player"], "team": row["Team"], "position": row["Position"],
-                    "manager": mgr, "price": str(int(price)), "note": ""
+                    "player": pdraft["player"], "team": pdraft["team"], "position": pdraft["pos"],
+                    "manager": mgr, "price": str(int(safe_int_or(price,1))), "note": ""
                 })
-                ok,msg = update_league_team_after_pick(sh, mgr, row["Position"], price)
-                if not ok: st.warning(msg)
-                # refresh recs + reload UI
+                # Update League_Teams (budget + open slots)
+                ok,msg = update_league_team_after_pick(sh, mgr, pdraft["pos"], safe_int_or(price,1))
+                if not ok:
+                    st.warning(msg)
+
+                # Recompute recommendations (inflation, caps)
                 write_recommendations_to_players(sh)
-                st.toast(f"Drafted {row['Player']} for ${int(price)} to {mgr}.")
+
+                # Clear pending + hard refresh so player vanishes immediately
+                set_pending_draft(None)
+                st.toast(f"Drafted {pdraft['player']} for ${int(safe_int_or(price,1))} to {mgr}.")
                 st.cache_data.clear(); st.rerun()
             except Exception as e:
                 st.error(f"Draft failed: {e}")
-
 
 # --------------------------- Nomination Recommendations ---------------------------
 with st.expander("🧠 Nomination Recommendations (position-aware)", expanded=False):
