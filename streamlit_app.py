@@ -83,6 +83,16 @@ def get_tag_columns(df):
 def is_truthy(v):
     s = str(v).strip().lower()
     return s in ("1","true","yes","y")
+    
+def safe_int_or(v, default=1):
+    """Coerce a scalar or 1-row Series to int safely; blank/NaN -> default."""
+    try:
+        s = pd.to_numeric(v, errors="coerce")
+        if isinstance(s, pd.Series):
+            s = s.iloc[0] if len(s) else None
+        return int(s) if pd.notna(s) and s >= 1 else default
+    except Exception:
+        return default
 
 # --------------------------- Sleeper (mini header) ---------------------------
 @st.cache_data(ttl=300)
@@ -722,7 +732,7 @@ with c_draft:
         t_show = str(meta_row["Team"].iloc[0]) if not meta_row.empty and "Team" in meta_row.columns else ""
         p_show = str(meta_row["Position"].iloc[0]) if not meta_row.empty and "Position" in meta_row.columns else ""
         st.caption(f"{p_show} · {t_show}")
-        base_soft = int(meta_row["soft_rec_$"].iloc[0]) if not meta_row.empty and pd.notna(meta_row["soft_rec_$"].iloc[0]) else 1
+        base_soft = safe_int_or(meta_row["soft_rec_$"] if not meta_row.empty else None, default=1)
         sel_price = st.number_input("Price", min_value=1, max_value=500, step=1, value=base_soft, key="pick_price")
         sel_mgr = st.selectbox("Team (buyer)", mgr_opts if mgr_opts else [""], index=0 if mgr_opts else 0, placeholder="Select team…", key="pick_mgr")
         draft_btn = st.button("✅ Mark Drafted & Log", type="primary", use_container_width=True, disabled=not (write_ready and not practice))
@@ -751,7 +761,7 @@ with c_price:
         pos = str(row["Position"].iloc[0]) if not row.empty and "Position" in row.columns else ""
         team = str(row["Team"].iloc[0]) if not row.empty and "Team" in row.columns else ""
         st.caption(f"{pos} · {team}")
-        base_soft = int(row["soft_rec_$"].iloc[0]) if not row.empty and pd.notna(row["soft_rec_$"].iloc[0]) else 1
+        base_soft = safe_int_or(row["soft_rec_$"] if not row.empty else None, default=1)
         ob_price  = st.number_input("Price to check", min_value=1, max_value=500, step=1, value=base_soft, key="ob_price")
 
         can_list=[]
