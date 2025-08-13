@@ -717,6 +717,14 @@ with st.sidebar:
             ok,msg = write_recommendations_to_players(sh, teams=teams, budget=budget)
         st.toast(msg if ok else f"⚠️ {msg}")
         st.cache_data.clear(); st.rerun()
+    
+    # --- Refresh Data (Clear Cache) ---
+    st.divider()
+    if st.button("🔁 Refresh Data (clear cache)", use_container_width=True):
+        st.cache_data.clear()
+        st.toast("Caches cleared. Reloading…")
+        st.rerun()
+
 
     if admin_mode:
         st.divider()
