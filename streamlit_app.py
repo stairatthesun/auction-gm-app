@@ -1173,7 +1173,11 @@ with st.expander("🪤 Nomination Trap Finder", expanded=False):
                 outbid.append(cnt)
         dfT["outbid_count"] = outbid if outbid else 0
 
-        avoid_mask = dfT.get("FFG_Avoid","").astype(str).str.lower().isin(["true","1","yes","y"])
+        # Safe avoid mask (ensure column exists and is a Series)
+        if "FFG_Avoid" not in dfT.columns:
+            dfT["FFG_Avoid"] = ""
+        avoid_mask = dfT["FFG_Avoid"].astype(str).str.lower().isin(["true","1","yes","y"])
+
         trap_mask = (dfT["surplus_$"] < 0) | avoid_mask
         # "demand" proxy: better ADP (lower number) or many outbidders
         demand = (-dfT["ADP"].fillna(999)).rank(pct=True) + (dfT["outbid_count"]).rank(pct=True)
