@@ -641,8 +641,9 @@ def build_nomination_traps(players_df: pd.DataFrame, league_df: pd.DataFrame, to
         base_val = (df["soft_rec_$"] / 1.15)
     df["surplus_$"] = df["soft_rec_$"] - base_val  # negative is bad (overpay risk)
 
-    # Avoid weight (very strong)
-    df["avoid_flag"] = df.get("FFG_Avoid","").astype(str).str.lower().isin(["true","1","yes","y"]).astype(int)
+    # Avoid weight (very strong) — safe when column missing
+    avoid_series = df["FFG_Avoid"] if "FFG_Avoid" in df.columns else pd.Series([""]*len(df), index=df.index)
+    df["avoid_flag"] = avoid_series.astype(str).str.lower().isin(["true","1","yes","y"]).astype(int)
 
     # Outbid count awareness
     outbid_counts = []
@@ -685,7 +686,6 @@ def build_nomination_traps(players_df: pd.DataFrame, league_df: pd.DataFrame, to
     df["scarcity_factor"] = df["Position"].map(sca).fillna(0.0)
 
     # Trap score (heavily weight Avoid)
-    # weights: avoid 0.6, overpay pressure 0.2 (negative surplus), outbid 0.15, scarcity 0.05
     neg_surplus = (-df["surplus_$"]).clip(lower=0)
     df["trap_score"] = 0.60*df["avoid_flag"] + 0.20*neg_surplus.rank(pct=True) + 0.15*df["outbid_count"].rank(pct=True) + 0.05*df["scarcity_factor"].rank(pct=True)
 
@@ -762,6 +762,28 @@ with st.sidebar:
         st.cache_data.clear()
         st.toast("Caches cleared. Reloading data…")
 
+    # --- Admin Console lives in the sidebar ---
+    if admin_mode:
+        st.divider()
+        st.subheader("🛠️ Admin Console")
+        c1, c2 = st.columns(2)
+        if c1.button("♻️ Reset Draft"):
+            if write_ready and not practice:
+                with st.spinner("Resetting…"):
+                    ok,msg = admin_reset(sh)
+                st.success(msg) if ok else st.error(msg)
+                st.cache_data.clear(); st.rerun()
+            else:
+                st.warning("Enable write access and turn off Practice Mode.")
+        if c2.button("📦 Archive + Reset"):
+            if write_ready and not practice:
+                with st.spinner("Archiving & resetting…"):
+                    ok,msg = admin_archive_and_reset(sh)
+                st.success(msg) if ok else st.error(msg)
+                st.cache_data.clear(); st.rerun()
+            else:
+                st.warning("Enable write access and turn off Practice Mode.")
+
 # Tiny league header
 if SLEEPER_LEAGUE_ID:
     try:
@@ -795,81 +817,6 @@ if players_df is None or players_df.empty:
 for c in ["status","Position","Player","Team","soft_rec_$","AAV","ADP","VOR","Points","Rank Overall","Rank Position","drafted_by","price_paid"]:
     if c not in players_df.columns:
         players_df[c] = (float("nan") if c in ("soft_rec_$","AAV","ADP","VOR","Points","Rank Overall","Rank Position") else "")
-
-# --------------------------- ADMIN CONSOLE (visible only if admin_mode) ---------------------------
-def admin_reset(sh):
-    # Reset Players: drafted fields
-    wsP = sh.worksheet("Players")
-    dfP = normalize_cols(ws_to_df(wsP))
-    for c in ["status","drafted_by","price_paid"]:
-        if c not in dfP.columns: dfP[c] = ""
-    dfP["status"] = ""
-    dfP["drafted_by"] = ""
-    dfP["price_paid"] = ""
-    write_dataframe_to_sheet(wsP, dfP, header=True)
-
-    # Reset League_Teams: budget, max_bid, per-open-slot, open_* to defaults
-    wsL = sh.worksheet("League_Teams")
-    dfL = normalize_cols(ws_to_df(wsL))
-    if not dfL.empty:
-        if "budget_remaining" in dfL.columns:
-            dfL["budget_remaining"] = 200  # default
-        open_map = detect_open_cols(dfL)
-        if open_map:
-            defaults = {"QB":1,"RB":2,"WR":2,"TE":1,"FLEX":1,"K":1,"DST":1,"BENCH":6}
-            for pos, col in open_map.items():
-                dfL[col] = defaults.get(pos, 0)
-            # recompute max_bid & per slot
-            for i in dfL.index:
-                mb, pps = recompute_maxbid_and_pps(dfL.loc[i,:], open_map)
-                if "max_bid" in dfL.columns: dfL.at[i,"max_bid"] = int(mb)
-                if "(auto)_$per_open_slot" in dfL.columns: dfL.at[i,"(auto)_$per_open_slot"] = int(pps)
-        write_dataframe_to_sheet(wsL, dfL, header=True)
-
-    # Clear Draft_Log
-    wsD = upsert_worksheet(sh, "Draft_Log")
-    wsD.clear()
-    ensure_draft_log_header(wsD)
-
-    # Recompute recommendations
-    write_recommendations_to_players(sh)
-    return True, "Reset complete."
-
-def admin_archive_and_reset(sh):
-    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    # Archive Players / League_Teams / Draft_Log into separate tabs
-    for tab in ("Players","League_Teams","Draft_Log"):
-        try:
-            ws_src = sh.worksheet(tab)
-            rows = ws_src.get_all_values()
-            title = f"Archive_{tab}_{ts}"
-            ws_dest = upsert_worksheet(sh, title, rows=max(2000, len(rows)+10), cols=max(30, len(rows[0])+2) if rows else 30)
-            ws_dest.clear()
-            if rows:
-                ws_dest.update("A1", rows, value_input_option="RAW")
-        except Exception:
-            pass
-    ok,msg = admin_reset(sh)
-    return ok, f"Archived (Players/League_Teams/Draft_Log) and reset."
-
-if admin_mode:
-    st.divider()
-    with st.expander("🛠️ Admin Console", expanded=True):
-        c1, c2 = st.columns(2)
-        if c1.button("♻️ Reset Draft (Players/League_Teams/Draft_Log)"):
-            if write_ready and not practice:
-                with st.spinner("Resetting…"):
-                    ok,msg = admin_reset(sh)
-                st.success(msg) if ok else st.error(msg)
-            else:
-                st.warning("Enable write access and turn off Practice Mode.")
-        if c2.button("📦 Archive + Reset"):
-            if write_ready and not practice:
-                with st.spinner("Archiving & resetting…"):
-                    ok,msg = admin_archive_and_reset(sh)
-                st.success(msg) if ok else st.error(msg)
-            else:
-                st.warning("Enable write access and turn off Practice Mode.")
 
 # --------------------------- Top Row: Draft Log + Best Values + Teams ---------------------------
 st.divider()
@@ -1010,7 +957,7 @@ with f3:
 with f4: hide_drafted = st.toggle("Hide drafted", value=True)
 with f5: sort_by = st.selectbox("Sort by", ["Rank Overall","soft_rec_$","AAV","VOR","Points","ADP","Rank Position"], index=0)
 
-# --------------------------- Draft Board (with checkbox selection & modal) ---------------------------
+# --------------------------- Draft Board (with checkbox selection & inline form) ---------------------------
 st.subheader("📋 Draft Board")
 
 if players_df.empty:
@@ -1070,30 +1017,32 @@ else:
     st.write("")
     draft_sel_btn = st.button("✅ Draft Selected", type="primary", use_container_width=False, disabled=not (write_ready and not practice))
 
+    # --- Inline confirmation form (no modal) ---
     if draft_sel_btn and write_ready and not practice:
-        try:
-            sel_rows = edited[edited["Select"]==True]
-            if sel_rows.empty:
-                st.warning("Check a player in the Draft? column first.")
-            elif len(sel_rows) > 1:
-                st.warning("Please select exactly one player at a time.")
-            else:
-                row = sel_rows.iloc[0]
-                name, team, pos = row["Player"], row["Team"], row["Position"]
-                default_price = safe_int_val(row.get("soft_rec_$", 1), 1)
+        sel_rows = edited[edited["Select"]==True]
+        if sel_rows.empty:
+            st.warning("Check a player in the Draft? column first.")
+        elif len(sel_rows) > 1:
+            st.warning("Please select exactly one player at a time.")
+        else:
+            row = sel_rows.iloc[0]
+            name, team, pos = row["Player"], row["Team"], row["Position"]
+            default_price = safe_int_val(row.get("soft_rec_$", 1), 1)
 
-                mgr_opts = []
-                if not league_df.empty and "team_name" in league_df.columns:
-                    mgr_opts = sorted([t for t in league_df["team_name"].dropna().astype(str).tolist() if t])
+            mgr_opts = []
+            if not league_df.empty and "team_name" in league_df.columns:
+                mgr_opts = sorted([t for t in league_df["team_name"].dropna().astype(str).tolist() if t])
 
-                with st.modal(f"Draft {name} ({pos} · {team})"):
-                    sel_mgr = st.selectbox("Team (buyer)", mgr_opts if mgr_opts else [""], index=0 if mgr_opts else 0, placeholder="Select team…", key="modal_pick_mgr")
-                    sel_price = st.number_input("Price", min_value=1, max_value=500, step=1, value=default_price, key="modal_pick_price")
-                    c1, c2 = st.columns([1,1])
-                    do_confirm = c1.button("Confirm Draft", type="primary")
-                    do_cancel  = c2.button("Cancel")
+            with st.form("confirm_draft_form", clear_on_submit=False):
+                st.markdown(f"**Draft:** {name} &middot; {pos} · {team}")
+                sel_mgr = st.selectbox("Team (buyer)", mgr_opts if mgr_opts else [""], index=0 if mgr_opts else 0, placeholder="Select team…")
+                sel_price = st.number_input("Price", min_value=1, max_value=500, step=1, value=default_price)
+                c1, c2 = st.columns(2)
+                do_confirm = c1.form_submit_button("Confirm Draft")
+                do_cancel  = c2.form_submit_button("Cancel")
 
-                    if do_confirm:
+                if do_confirm:
+                    try:
                         update_player_drafted(sh, (name, team, pos), sel_mgr, sel_price)
                         wsD = upsert_worksheet(sh, "Draft_Log")
                         ensure_draft_log_header(wsD)
@@ -1110,11 +1059,12 @@ else:
                         if not ok: st.warning(msg)
                         write_recommendations_to_players(sh)
                         st.toast(f"Drafted {name} for ${sel_price}.")
+                        st.cache_data.clear()
                         st.rerun()
-                    if do_cancel:
-                        st.rerun()
-        except Exception as e:
-            st.error(f"Draft flow failed: {e}")
+                    except Exception as e:
+                        st.error(f"Draft flow failed: {e}")
+                elif do_cancel:
+                    st.rerun()
 
 # --------------------------- Nomination Recommendations ---------------------------
 with st.expander("🧠 Nomination Recommendations (position-aware)", expanded=False):
