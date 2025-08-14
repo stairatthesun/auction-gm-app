@@ -1073,73 +1073,38 @@ else:
             if not league_df.empty and "team_name" in league_df.columns:
                 mgr_opts = sorted([t for t in league_df["team_name"].dropna().astype(str).tolist() if t])
 
-            # keep everything above intact…
-            if draft_sel_btn and write_ready and not practice:
-                sel_rows = edited[edited["Select"]==True]
-                if sel_rows.empty:
-                    st.warning("Check a player in the Draft? column first.")
-                elif len(sel_rows) > 1:
-                    st.warning("Please select exactly one player at a time.")
-                else:
-                    row = sel_rows.iloc[0]
-                    name, team, pos = row["Player"], row["Team"], row["Position"]
-                    default_price = safe_int_val(row.get("soft_rec_$", 1), 1)
+            with st.form("confirm_draft_form", clear_on_submit=False):
+                st.markdown(f"**Draft:** {name} &middot; {pos} · {team}")
+                sel_mgr = st.selectbox("Team (buyer)", mgr_opts if mgr_opts else [""], index=0 if mgr_opts else 0, placeholder="Select team…")
+                sel_price = st.number_input("Price", min_value=1, max_value=500, step=1, value=default_price)
+                c1, c2 = st.columns(2)
+                do_confirm = c1.form_submit_button("Confirm Draft")
+                do_cancel  = c2.form_submit_button("Cancel")
 
-                    mgr_opts = []
-                    if not league_df.empty and "team_name" in league_df.columns:
-                        mgr_opts = sorted([t for t in league_df["team_name"].dropna().astype(str).tolist() if t])
-
-                    # NEW: persist selection for the next rerun/submit
-                    st.session_state["pending_draft"] = {
-                        "name": name, "team": team, "pos": pos,
-                        "default_price": default_price, "mgr_opts": mgr_opts
-                    }
-                    
-            # NEW: render/handle the confirmation form on every rerun if we have a pending draft
-            if "pending_draft" in st.session_state:
-                pdraft = st.session_state["pending_draft"]
-                name, team, pos = pdraft["name"], pdraft["team"], pdraft["pos"]
-                mgr_opts = pdraft.get("mgr_opts", []) or [""]
-
-                with st.form("confirm_draft_form", clear_on_submit=False):
-                    st.markdown(f"**Draft:** {name} · {pos} · {team}")
-                    sel_mgr = st.selectbox("Team (buyer)", mgr_opts, index=0, key="confirm_mgr")
-                    sel_price = st.number_input("Price", min_value=1, max_value=500, step=1,
-                                                value=int(pdraft.get("default_price", 1)), key="confirm_price")
-                    c1, c2 = st.columns(2)
-                    do_confirm = c1.form_submit_button("Confirm Draft")
-                    do_cancel  = c2.form_submit_button("Cancel")
-
-                    if do_confirm:
-                        try:
-                            update_player_drafted(sh, (name, team, pos), sel_mgr, sel_price)
-                            wsD = upsert_worksheet(sh, "Draft_Log")
-                            ensure_draft_log_header(wsD)
-                            pick_no = next_pick_number(wsD)
-                            append_draft_log(sh, {
-                                "pick": pick_no,
-                                "player": name,
-                                "team": team,
-                                "position": pos,
-                                "manager": sel_mgr,
-                                "price": str(int(sel_price))
-                            })
-                            ok, msg = update_league_team_after_pick(sh, sel_mgr, pos, sel_price)
-                            if not ok:
-                                st.warning(msg)
-                            write_recommendations_to_players(sh)
-                            st.toast(f"Drafted {name} for ${int(sel_price)}.")
-                        except Exception as e:
-                            st.error(f"Draft flow failed: {e}")
-                        finally:
-                            # Always clean up and rerun for a fresh UI/state
-                            del st.session_state["pending_draft"]
-                            st.cache_data.clear()
-                            st.rerun()
-
-                    if do_cancel:
-                        del st.session_state["pending_draft"]
+                if do_confirm:
+                    try:
+                        update_player_drafted(sh, (name, team, pos), sel_mgr, sel_price)
+                        wsD = upsert_worksheet(sh, "Draft_Log")
+                        ensure_draft_log_header(wsD)
+                        pick_no = next_pick_number(wsD)
+                        append_draft_log(sh, {
+                            "pick": pick_no,
+                            "player": name,
+                            "team": team,
+                            "position": pos,
+                            "manager": sel_mgr,
+                            "price": str(int(sel_price))
+                        })
+                        ok,msg = update_league_team_after_pick(sh, sel_mgr, pos, sel_price)
+                        if not ok: st.warning(msg)
+                        write_recommendations_to_players(sh)
+                        st.toast(f"Drafted {name} for ${sel_price}.")
+                        st.cache_data.clear()
                         st.rerun()
+                    except Exception as e:
+                        st.error(f"Draft flow failed: {e}")
+                elif do_cancel:
+                    st.rerun()
 
 # --------------------------- Nomination Recommendations ---------------------------
 with st.expander("🧠 Nomination Recommendations (position-aware)", expanded=False):
