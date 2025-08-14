@@ -49,6 +49,9 @@ CANON = {
 IDENTITY_COLS = ["Player","Team","Position"]
 PROJ_COLS = ["Points","VOR","ADP","AAV","Rank Overall","Rank Position"]
 
+# Known tag columns — used to ensure persistence on every write
+TAG_COLS = ["FFG_MyGuy","FFG_Sleeper","FFG_Bust","FFG_Value","FFG_Breakout","FFG_Avoid","FFG_Injury"]
+
 # --------------------------- Utilities ---------------------------
 def normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
@@ -62,6 +65,15 @@ def normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
     for c in df.columns:
         if df[c].dtype == object:
             df[c] = df[c].astype(str).str.strip()
+    return df
+
+def ensure_tag_columns(df: pd.DataFrame, tags=TAG_COLS) -> pd.DataFrame:
+    """Guarantee all FFG_* columns exist before writing Players; prevents accidental drops."""
+    if df is None or df.empty:
+        return df
+    for c in tags:
+        if c not in df.columns:
+            df[c] = ""
     return df
 
 def choose_keys(df_left, df_right):
@@ -287,6 +299,9 @@ def smart_sync_projections_to_players(sh, preserve_tags=True, update_identity=Fa
     if merged.empty:
         return False, "Smart Sync aborted — result empty (likely key mismatch)."
 
+    # --- ensure all tag columns survive the write ---
+    merged = ensure_tag_columns(merged)
+
     write_dataframe_to_sheet(ws_players, merged, header=True)
     updated = len(df_r); added = len(right_only)
     return True, f"Smart Sync done: updated {updated:,}, added {added:,}. Keys: {', '.join(keys)}."
@@ -364,6 +379,10 @@ def write_recommendations_to_players(sh, teams=14, budget=200):
     for c in ["(auto) inflation_index","soft_rec_$","hard_cap_$"]:
         if f"{c}_new" in merged.columns:
             merged[c] = merged[f"{c}_new"]; merged.drop(columns=[f"{c}_new"], inplace=True, errors="ignore")
+
+    # --- preserve tag columns on write ---
+    merged = ensure_tag_columns(merged)
+
     write_dataframe_to_sheet(ws, merged, header=True)
     return True, "Recommendations updated."
 
@@ -470,6 +489,9 @@ def update_player_drafted(sh, player_key, manager, price):
     df = normalize_cols(ws_to_df(ws))
     for c in ["status","drafted_by","price_paid"]:
         if c not in df.columns: df[c]=""
+    # --- ensure tag columns are retained ---
+    df = ensure_tag_columns(df)
+
     mask = (df["Player"]==player_key[0]) & (df["Team"]==player_key[1]) & (df["Position"]==player_key[2])
     if not mask.any(): raise RuntimeError("Player not found in Players sheet.")
     idx = df.index[mask][0]
@@ -770,7 +792,7 @@ with st.sidebar:
         if c1.button("♻️ Reset Draft"):
             if write_ready and not practice:
                 with st.spinner("Resetting…"):
-                    ok,msg = admin_reset(sh)
+                    ok,msg = admin_reset(sh)  # assumes these helpers exist in your environment
                 st.success(msg) if ok else st.error(msg)
                 st.cache_data.clear(); st.rerun()
             else:
@@ -778,7 +800,7 @@ with st.sidebar:
         if c2.button("📦 Archive + Reset"):
             if write_ready and not practice:
                 with st.spinner("Archiving & resetting…"):
-                    ok,msg = admin_archive_and_reset(sh)
+                    ok,msg = admin_archive_and_reset(sh)  # assumes these helpers exist in your environment
                 st.success(msg) if ok else st.error(msg)
                 st.cache_data.clear(); st.rerun()
             else:
@@ -845,11 +867,12 @@ with col_best:
         st.caption("Load players first.")
     else:
         dfv = players_df.copy()
-        for c in ["soft_rec_$","AAV","Points","VOR","ADP","Rank Overall"]:
+        for c in ["soft_rec_$","AAV","Points","VOR","ADP","Rank Overall","Rank Position"]:
             if c in dfv.columns:
                 dfv[c] = pd.to_numeric(dfv[c], errors="coerce")
         dfv = dfv[dfv["status"].astype(str).str.lower()!="drafted"]
         dfv["value_surplus"] = dfv["soft_rec_$"] - dfv["AAV"]
+
         def tag_icons(row):
             out=[]
             if is_truthy(row.get("FFG_MyGuy","")): out.append("⭐")
@@ -867,11 +890,19 @@ with col_best:
         if pos_filter:
             dfv = dfv[dfv["Position"].isin(pos_filter)]
 
-        cols = ["Tags","Position","Player","Team","soft_rec_$","AAV","value_surplus","Rank Overall"]
-        for c in cols:
-            if c not in dfv.columns: dfv[c]=""
-        dfv = dfv.sort_values(["value_surplus","soft_rec_$"], ascending=[False,False]).head(15)
-        st.dataframe(dfv[cols], hide_index=True, use_container_width=True, height=240)
+        # Build compact display with accurate Player, no Team, and Pos Rk
+        disp_cols = ["Tags","Position","Player","soft_rec_$","AAV","value_surplus","Rank Position"]
+        for c in disp_cols:
+            if c not in dfv.columns: dfv[c] = ""
+        display_df = dfv.sort_values(["value_surplus","soft_rec_$"], ascending=[False,False]).head(15)[disp_cols].rename(
+            columns={
+                "Position":"Pos",
+                "soft_rec_$":"Rec $",
+                "value_surplus":"Δ$",
+                "Rank Position":"Pos Rk",
+            }
+        )
+        st.dataframe(display_df, hide_index=True, use_container_width=True, height=240)
 
 with col_teams:
     st.subheader("👥 Teams")
@@ -992,24 +1023,33 @@ else:
     else:
         view = view.sort_values(by="Rank Overall", ascending=True, na_position="last")
 
-    show_cols = ["Tags","Position","Player","Team","soft_rec_$","hard_cap_$","AAV","VOR","Points","ADP","Rank Overall","status","drafted_by","price_paid"]
+    # Add "Pos Rk" derived column for display convenience
+    view["Pos Rk"] = pd.to_numeric(view.get("Rank Position"), errors="coerce")
+
+    show_cols = ["Tags","Position","Player","Team","soft_rec_$","hard_cap_$","AAV","VOR","Points","ADP","Rank Overall","status","drafted_by","price_paid","Pos Rk"]
     for c in show_cols:
         if c not in view.columns: view[c]=""
 
-    # Checkbox select column (local only)
+    # Checkbox select column (local only). Keep _key internal; don't display it.
     view = view.copy()
     view["Select"] = False
     view["_key"]   = view["Player"].astype(str) + " | " + view["Team"].astype(str) + " | " + view["Position"].astype(str)
 
     edited = st.data_editor(
-        view[["Select"] + show_cols + ["_key"]],
+        view[["Select"] + show_cols],  # NOTE: no "_key" in displayed columns
         use_container_width=True,
         height=520,
         column_config={
             "Select": st.column_config.CheckboxColumn("Draft?", help="Check to draft this player"),
-            "_key": st.column_config.TextColumn("_key", help="row key", width="small"),
+            "Position": st.column_config.TextColumn("Pos"),
+            "soft_rec_$": st.column_config.NumberColumn("Rec $"),
+            "hard_cap_$": st.column_config.NumberColumn("Hard Cap"),
+            "status": st.column_config.TextColumn("Status"),
+            "drafted_by": st.column_config.TextColumn("Drafted By"),
+            "price_paid": st.column_config.NumberColumn("Price"),
+            "Pos Rk": st.column_config.NumberColumn("Pos Rk"),
         },
-        disabled=show_cols + ["_key"],  # only Select is editable
+        disabled=show_cols,  # only Select is editable
         hide_index=True,
         key="draft_table"
     )
@@ -1098,11 +1138,14 @@ with st.expander("🔥 Bidding Heatmap", expanded=False):
         st.caption("Heatmap unavailable (need League_Teams with open_* cols, budget_remaining, max_bid).")
     else:
         try:
-            styled = H.style.background_gradient(axis=None)  # requires matplotlib
-            st.dataframe(styled, use_container_width=True, height=280)
+            # format as integers for display, keep gradient
+            styled = H.style.background_gradient(axis=None).format("{:.0f}")
+            # dynamic height: ~28px per row + header room
+            table_height = max(120, 32 + 28 * len(H.index))
+            st.dataframe(styled, use_container_width=True, height=table_height)
             st.caption("Interpretation: hotter = higher potential spend & stronger need at that position.")
         except Exception:
-            st.dataframe(H, use_container_width=True, height=280)
+            st.dataframe(H.round(0).astype(int), use_container_width=True, height=max(120, 32 + 28 * len(H.index)))
 
 # --------------------------- Nomination Trap Finder ---------------------------
 with st.expander("🪤 Nomination Trap Finder", expanded=False):
@@ -1137,6 +1180,8 @@ with st.expander("🏷️ Quick Tag Editor", expanded=True):
         if do_tag and write_ready and not practice:
             try:
                 ws = sh.worksheet("Players"); df = normalize_cols(ws_to_df(ws))
+                # ensure all tag columns persist on write
+                df = ensure_tag_columns(df)
                 if tgt_col not in df.columns: df[tgt_col]=""
                 mask = df["Player"].astype(str).eq(tg_player)
                 if not mask.any():
