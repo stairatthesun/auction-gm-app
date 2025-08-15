@@ -1,4 +1,4 @@
-# streamlit_app.py — Auction GM (stable build: in-table drafting, teams grid, heatmap, trap finder)
+# streamlit_app.py — Auction GM (stable build + tiers & alerts)
 import io, json, re
 from datetime import datetime
 
@@ -328,29 +328,47 @@ def load_bias_map(sh):
     except Exception:
         return {}
 
-def compute_recommended_values(df_players: pd.DataFrame, bias_map=None, budget=200, teams=14):
+def compute_recommended_values(df_players: pd.DataFrame, bias_map=None, budget=200, teams=14, league_df: pd.DataFrame=None):
+    """Inflation prefers remaining-budget model if League_Teams present; falls back to drafted exp/act."""
     df = df_players.copy()
     if bias_map is None: bias_map={}
     aav = pd.to_numeric(df.get("AAV"), errors="coerce")
     vor = pd.to_numeric(df.get("VOR"), errors="coerce")
     pts = pd.to_numeric(df.get("Points"), errors="coerce")
 
-    base = aav.copy() if "AAV" in df.columns else pd.Series([float("nan")]*len(df))
+    base = aav.copy() if "AAV" in df.columns else pd.Series([float("nan")]*len(df), index=df.index)
     if base.isna().all() and vor.notna().sum()>0:
         pos_v = vor.clip(lower=0); pool=budget*teams; tv=pos_v.sum()
         base = (pos_v/tv*pool) if tv>0 else pos_v
     if base.isna().all() and pts.notna().sum()>0:
         pos_p = pts.clip(lower=0); pool=budget*teams; tp=pos_p.sum()
         base = (pos_p/tp*pool) if tp>0 else pos_p
-    if base.isna().all(): base = pd.Series([0.0]*len(df))
+    if base.isna().all(): base = pd.Series([0.0]*len(df), index=df.index)
 
-    paid = pd.to_numeric(df.get("price_paid"), errors="coerce").fillna(0)
     drafted = df.get("status","").astype(str).str.lower().eq("drafted")
-    exp_spend = base.where(drafted, 0).sum(skipna=True)
-    act_spend = paid.sum()
+    paid = pd.to_numeric(df.get("price_paid"), errors="coerce").fillna(0)
+
+    # Prefer remaining budget vs remaining base model
     inflation = 1.0
-    if exp_spend and exp_spend>0:
-        inflation = max(0.75, min(1.5, act_spend/exp_spend))
+    used_remaining_model = False
+    try:
+        if league_df is not None and not league_df.empty and "budget_remaining" in league_df.columns:
+            remaining_budget = pd.to_numeric(league_df["budget_remaining"], errors="coerce").fillna(0).sum()
+            remaining_base   = base.where(~drafted, 0).sum(skipna=True)
+            if remaining_base and remaining_base > 0:
+                inflation = float(remaining_budget) / float(remaining_base)
+                used_remaining_model = True
+    except Exception:
+        pass
+
+    if not used_remaining_model:
+        exp_spend = base.where(drafted, 0).sum(skipna=True)
+        act_spend = paid.sum()
+        if exp_spend and exp_spend>0:
+            inflation = act_spend/exp_spend
+
+    # sane bounds
+    inflation = max(0.60, min(1.60, float(inflation)))
 
     team_ser = df.get("Team","").astype(str)
     bias_factor = team_ser.map(lambda t: 1.0 + (float(bias_map.get(t,0))/100.0 if t in bias_map else 0.0))
@@ -370,8 +388,17 @@ def write_recommendations_to_players(sh, teams=14, budget=200):
     df = normalize_cols(ws_to_df(ws))
     for c in ["AAV","VOR","Points","status","price_paid","Team"]:
         if c not in df.columns: df[c] = ""
+
+    # Try to load League_Teams for remaining-budget model
+    league_df_local = pd.DataFrame()
+    try:
+        ws_league = sh.worksheet("League_Teams")
+        league_df_local = normalize_cols(ws_to_df(ws_league))
+    except Exception:
+        pass
+
     bias = load_bias_map(sh)
-    out = compute_recommended_values(df, bias_map=bias, budget=budget, teams=teams)
+    out = compute_recommended_values(df, bias_map=bias, budget=budget, teams=teams, league_df=league_df_local)
     merged = df.merge(
         out[["Player","Team","Position","(auto) inflation_index","soft_rec_$","hard_cap_$"]],
         on=["Player","Team","Position"], how="left", suffixes=("","_new")
@@ -726,6 +753,109 @@ def build_nomination_traps(players_df: pd.DataFrame, league_df: pd.DataFrame, to
         if c not in df.columns: df[c]=""
     return df.sort_values(["trap_score"], ascending=False).head(top_n)[cols + ["trap_score"]]
 
+# --------------------------- Tiers (static by expected points) ---------------------------
+TIER_MIN_DROP = {"QB":6, "RB":10, "WR":10, "TE":6, "K":2, "DST":2}
+
+def _tag_emojis(row):
+    out=[]
+    if is_truthy(row.get("FFG_MyGuy","")): out.append("⭐")
+    if is_truthy(row.get("FFG_Sleeper","")): out.append("💤")
+    if is_truthy(row.get("FFG_Bust","")): out.append("⚠️")
+    if is_truthy(row.get("FFG_Value","")): out.append("💎")
+    if is_truthy(row.get("FFG_Breakout","")): out.append("🚀")
+    if is_truthy(row.get("FFG_Avoid","")): out.append("⛔")
+    if is_truthy(row.get("FFG_Injury","")): out.append("🩹")
+    return " ".join(out)
+
+def assign_tiers_for_position(df_pos: pd.DataFrame, pos: str) -> pd.DataFrame:
+    x = df_pos.copy()
+    x["Points"] = pd.to_numeric(x.get("Points"), errors="coerce").fillna(-1e9)
+    x = x.sort_values("Points", ascending=False).reset_index(drop=True)
+    if x.empty:
+        x["Tier"] = 1
+        return x
+
+    diffs = x["Points"].shift(0) - x["Points"].shift(-1)
+    diffs = diffs.fillna(0)
+    try:
+        p80 = float(diffs.quantile(0.80))
+    except Exception:
+        p80 = 0.0
+    abs_floor = TIER_MIN_DROP.get(pos, 8)
+    threshold = max(p80, abs_floor)
+
+    tier = 1
+    tiers = [tier]
+    for i in range(len(x)-1):
+        if diffs.iloc[i] >= threshold:
+            tier += 1
+        tiers.append(tier)
+    x["Tier"] = tiers
+    return x
+
+def compute_point_tiers(players_df: pd.DataFrame) -> pd.DataFrame:
+    if players_df is None or players_df.empty:
+        return pd.DataFrame()
+
+    df = players_df.copy()
+    for c in ["Position","Player","Team","Points","status"]:
+        if c not in df.columns: df[c] = ""
+    df["Points"] = pd.to_numeric(df.get("Points"), errors="coerce")
+    df["status"] = df["status"].astype(str).str.lower()
+
+    frames=[]
+    for pos in df["Position"].dropna().unique().tolist():
+        sub = df[df["Position"]==pos].copy()
+        frames.append(assign_tiers_for_position(sub, pos))
+    if not frames:
+        return pd.DataFrame()
+    out = pd.concat(frames, ignore_index=True)
+
+    out["Tags"] = out.apply(_tag_emojis, axis=1)
+    def name_fmt(row):
+        nm = f"{row.get('Player','')}"
+        if row.get("status","") == "drafted":
+            nm = f"~~{nm}~~"
+        tag = row.get("Tags","")
+        if tag: nm = f"{nm} {tag}"
+        return nm
+    out["Display"] = out.apply(name_fmt, axis=1)
+    return out
+
+def tier_collapse_flags(df_tiers: pd.DataFrame, warn_at: int = 2) -> list[str]:
+    if df_tiers is None or df_tiers.empty: return []
+    msgs=[]
+    for pos in sorted(df_tiers["Position"].dropna().unique().tolist()):
+        sub = df_tiers[df_tiers["Position"]==pos]
+        live = sub[sub["status"]!="drafted"]
+        if live.empty: continue
+        cur_tier = int(live["Tier"].min())
+        left = int((live["Tier"]==cur_tier).sum())
+        if left <= warn_at:
+            msgs.append(f"{pos} Tier {cur_tier} is about to break ({left} left).")
+    return msgs
+
+def render_tier_board(df_tiers: pd.DataFrame):
+    if df_tiers is None or df_tiers.empty:
+        st.caption("No tiers available (need Points).")
+        return
+    positions_order = ["QB","RB","WR","TE","FLEX","K","DST","BENCH"]
+    positions = sorted(
+        df_tiers["Position"].dropna().unique().tolist(),
+        key=lambda p: positions_order.index(p) if p in positions_order else 999
+    )
+    max_tier = int(df_tiers["Tier"].max())
+    header = "| Tier | " + " | ".join(positions) + " |"
+    sep    = "|:---:|" + "|".join([":---:" for _ in positions]) + "|"
+    lines = [header, sep]
+    for t in range(1, max_tier+1):
+        cells=[]
+        for pos in positions:
+            names = df_tiers[(df_tiers["Position"]==pos) & (df_tiers["Tier"]==t)]["Display"].tolist()
+            cells.append("<br>".join(names) if names else "—")
+        lines.append(f"| {t} | " + " | ".join(cells) + " |")
+    st.markdown("\n".join(lines), unsafe_allow_html=True)
+
 # --------------------------- UI — Sidebar ---------------------------
 with st.sidebar:
     st.header("Connect")
@@ -839,6 +969,18 @@ if players_df is None or players_df.empty:
 for c in ["status","Position","Player","Team","soft_rec_$","AAV","ADP","VOR","Points","Rank Overall","Rank Position","drafted_by","price_paid"]:
     if c not in players_df.columns:
         players_df[c] = (float("nan") if c in ("soft_rec_$","AAV","ADP","VOR","Points","Rank Overall","Rank Position") else "")
+
+# --------------------------- Top Alerts (Tier collapse) ---------------------------
+if not players_df.empty:
+    try:
+        _tiers_alert = compute_point_tiers(players_df)
+        _msgs = tier_collapse_flags(_tiers_alert, warn_at=2)
+        if _msgs:
+            st.write("")  # space under header
+            for m in _msgs:
+                st.warning(m, icon="🔔")
+    except Exception:
+        pass
 
 # --------------------------- Top Row: Draft Log + Best Values + Teams ---------------------------
 st.divider()
@@ -1175,6 +1317,18 @@ with st.expander("🧠 Nomination Recommendations (position-aware)", expanded=Fa
                 if c not in enf_list.columns: enf_list[c]=""
             st.dataframe(enf_list[cols], hide_index=True, use_container_width=True, height=240)
 
+# --------------------------- Tier Board (static by expected points) ---------------------------
+with st.expander("🏷️ Tiers by Expected Points (static)", expanded=False):
+    if players_df.empty:
+        st.caption("Load players first.")
+    else:
+        try:
+            df_tiers = compute_point_tiers(players_df)
+            render_tier_board(df_tiers)
+            st.caption("Tiering uses points-based gaps (pos-dependent floors + 80th percentile drop). Drafted players shown with strikethrough.")
+        except Exception as e:
+            st.caption(f"Tiers unavailable: {e}")
+
 # --------------------------- Bidding Heatmap ---------------------------
 with st.expander("🔥 Bidding Heatmap", expanded=False):
     H = build_bidding_heatmap(league_df if not league_df.empty else pd.DataFrame())
@@ -1241,4 +1395,4 @@ with st.expander("🏷️ Quick Tag Editor", expanded=True):
                 st.error(f"Tag update failed: {e}")
 
 # Footer
-st.caption("Auction GM • in-table draft • roster grid • heatmap • traps • cached logs")
+st.caption("Auction GM • in-table draft • roster grid • heatmap • traps • tiers • cached logs")
