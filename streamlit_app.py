@@ -1,4 +1,4 @@
-# streamlit_app.py — Auction GM (stable build + tiers & alerts)
+# streamlit_app.py — Auction GM (stable build + tiers & alerts + liquidity & blended inflation + tags filter + value col)
 import io, json, re
 from datetime import datetime
 
@@ -308,6 +308,7 @@ def smart_sync_projections_to_players(sh, preserve_tags=True, update_identity=Fa
 
 # --------------------------- Bias & Recs ---------------------------
 def load_bias_map(sh):
+    # Retained for compatibility; no longer applied to recommendations.
     try:
         ws = sh.worksheet("Bias_Teams"); df = normalize_cols(ws_to_df(ws))
         if df.empty: return {}
@@ -328,98 +329,13 @@ def load_bias_map(sh):
     except Exception:
         return {}
 
-def compute_recommended_values(df_players: pd.DataFrame, bias_map=None, budget=200, teams=14, league_df: pd.DataFrame=None):
-    """Inflation prefers remaining-budget model if League_Teams present; falls back to drafted exp/act."""
-    df = df_players.copy()
-    if bias_map is None: bias_map={}
-    aav = pd.to_numeric(df.get("AAV"), errors="coerce")
-    vor = pd.to_numeric(df.get("VOR"), errors="coerce")
-    pts = pd.to_numeric(df.get("Points"), errors="coerce")
-
-    base = aav.copy() if "AAV" in df.columns else pd.Series([float("nan")]*len(df), index=df.index)
-    if base.isna().all() and vor.notna().sum()>0:
-        pos_v = vor.clip(lower=0); pool=budget*teams; tv=pos_v.sum()
-        base = (pos_v/tv*pool) if tv>0 else pos_v
-    if base.isna().all() and pts.notna().sum()>0:
-        pos_p = pts.clip(lower=0); pool=budget*teams; tp=pos_p.sum()
-        base = (pos_p/tp*pool) if tp>0 else pos_p
-    if base.isna().all(): base = pd.Series([0.0]*len(df), index=df.index)
-
-    drafted = df.get("status","").astype(str).str.lower().eq("drafted")
-    paid = pd.to_numeric(df.get("price_paid"), errors="coerce").fillna(0)
-
-    # Prefer remaining budget vs remaining base model
-    inflation = 1.0
-    used_remaining_model = False
-    try:
-        if league_df is not None and not league_df.empty and "budget_remaining" in league_df.columns:
-            remaining_budget = pd.to_numeric(league_df["budget_remaining"], errors="coerce").fillna(0).sum()
-            remaining_base   = base.where(~drafted, 0).sum(skipna=True)
-            if remaining_base and remaining_base > 0:
-                inflation = float(remaining_budget) / float(remaining_base)
-                used_remaining_model = True
-    except Exception:
-        pass
-
-    if not used_remaining_model:
-        exp_spend = base.where(drafted, 0).sum(skipna=True)
-        act_spend = paid.sum()
-        if exp_spend and exp_spend>0:
-            inflation = act_spend/exp_spend
-
-    # sane bounds
-    inflation = max(0.60, min(1.60, float(inflation)))
-
-    team_ser = df.get("Team","").astype(str)
-    bias_factor = team_ser.map(lambda t: 1.0 + (float(bias_map.get(t,0))/100.0 if t in bias_map else 0.0))
-    bias_adj = bias_factor.replace(0,1.0)
-
-    soft = (base * inflation / bias_adj).clip(lower=1).round(0)
-    hard = (soft * 1.10).round(0)
-
-    out = df.copy()
-    out["(auto) inflation_index"] = inflation
-    out["soft_rec_$"] = soft
-    out["hard_cap_$"] = hard
-    return out
-
-def write_recommendations_to_players(sh, teams=14, budget=200):
-    ws = sh.worksheet("Players")
-    df = normalize_cols(ws_to_df(ws))
-    for c in ["AAV","VOR","Points","status","price_paid","Team"]:
-        if c not in df.columns: df[c] = ""
-
-    # Try to load League_Teams for remaining-budget model
-    league_df_local = pd.DataFrame()
-    try:
-        ws_league = sh.worksheet("League_Teams")
-        league_df_local = normalize_cols(ws_to_df(ws_league))
-    except Exception:
-        pass
-
-    bias = load_bias_map(sh)
-    out = compute_recommended_values(df, bias_map=bias, budget=budget, teams=teams, league_df=league_df_local)
-    merged = df.merge(
-        out[["Player","Team","Position","(auto) inflation_index","soft_rec_$","hard_cap_$"]],
-        on=["Player","Team","Position"], how="left", suffixes=("","_new")
-    )
-    for c in ["(auto) inflation_index","soft_rec_$","hard_cap_$"]:
-        if f"{c}_new" in merged.columns:
-            merged[c] = merged[f"{c}_new"]; merged.drop(columns=[f"{c}_new"], inplace=True, errors="ignore")
-
-    # --- preserve tag columns on write ---
-    merged = ensure_tag_columns(merged)
-
-    write_dataframe_to_sheet(ws, merged, header=True)
-    return True, "Recommendations updated."
-
-# --------------------------- League_Teams helpers (per-position) ---------------------------
-POS_KEYS = ["QB","RB","WR","TE","FLEX","K","DST","BENCH"]
+# ---- Liquidity & scarcity helpers (starters-focused) ----
+STARTER_POS = ("QB","RB","WR","TE","K","DST")
 
 def detect_open_cols(df_league: pd.DataFrame):
     mapping={}
     cols = {c.lower(): c for c in df_league.columns}
-    for pos in POS_KEYS:
+    for pos in ["QB","RB","WR","TE","FLEX","K","DST","BENCH"]:
         want = f"open_{pos.lower()}"
         for lc, orig in cols.items():
             if lc == want:
@@ -427,9 +343,20 @@ def detect_open_cols(df_league: pd.DataFrame):
                 break
     return mapping
 
+def starter_open_count_row(row, open_map):
+    """Count only *starter* opens; FLEX counts fully here (we'll split across RB/WR/TE for scarcity later)."""
+    get = lambda c: int(pd.to_numeric(row.get(c,0), errors="coerce") or 0)
+    total = 0
+    for p in STARTER_POS:
+        if p in open_map:
+            total += get(open_map[p])
+    if "FLEX" in open_map:
+        total += get(open_map["FLEX"])
+    return int(max(0, total))
+
 def total_open_slots(row, open_map):
     total = 0
-    for pos, col in open_map.items():
+    for _, col in open_map.items():
         total += int(pd.to_numeric(row.get(col,0), errors="coerce") or 0)
     return int(max(0, total))
 
@@ -465,12 +392,191 @@ def decrement_slot_for_pick(row, position, open_map):
     if open_map.get("BENCH"): dec(open_map["BENCH"])
 
 def recompute_maxbid_and_pps(row, open_map):
+    """pps is per *open starter* now for UI purposes (bench ignored)."""
     b = float(pd.to_numeric(row.get("budget_remaining",0), errors="coerce") or 0)
-    total = total_open_slots(row, open_map)
-    max_bid = int(max(0, round(b - max(0, total - 1))))
-    pps = int(round(b / total)) if total>0 else int(b)
+    starters = starter_open_count_row(row, open_map)
+    max_bid = int(max(0, round(b - max(0, starters - 1))))
+    pps = int(round(b / starters)) if starters>0 else int(b)
     return max_bid, pps
 
+def league_starter_needs(df_league: pd.DataFrame):
+    """Return dict of league-wide open starter spots per position (FLEX contributes 1/3 to RB/WR/TE)."""
+    needs = {p:0 for p in STARTER_POS}
+    if df_league is None or df_league.empty: return needs
+    open_map = detect_open_cols(df_league)
+    if not open_map: return needs
+    get = lambda s: pd.to_numeric(df_league.get(s, 0), errors="coerce").fillna(0).sum()
+    for p in STARTER_POS:
+        if p in open_map:
+            needs[p] += int(get(open_map[p]))
+    flex_total = int(get(open_map["FLEX"])) if "FLEX" in open_map else 0
+    if flex_total:
+        flex_share = round(flex_total/3)
+        for p in ("RB","WR","TE"):
+            needs[p] += flex_share
+    return needs
+
+def position_supply(df_players: pd.DataFrame):
+    """Count undrafted players by position."""
+    if df_players is None or df_players.empty: return {p:1 for p in STARTER_POS}
+    df = df_players.copy()
+    if "status" in df.columns:
+        df = df[df["status"].astype(str).str.lower()!="drafted"]
+    return {p:int((df["Position"]==p).sum()) for p in df["Position"].dropna().unique()}
+
+def compute_liquidity_metrics(df_league: pd.DataFrame):
+    """Returns DataFrame with team, $/open_starter and liquidity_factor (relative to league median)."""
+    if df_league is None or df_league.empty or "team_name" not in df_league.columns:
+        return pd.DataFrame(columns=["team_name","per_open_starter","liquidity_factor"])
+    open_map = detect_open_cols(df_league)
+    rows=[]
+    for _,t in df_league.iterrows():
+        br = float(pd.to_numeric(t.get("budget_remaining",0), errors="coerce") or 0)
+        starters = starter_open_count_row(t, open_map) if open_map else int(pd.to_numeric(t.get("roster_spots_open",0), errors="coerce") or 0)
+        pos = br / starters if starters>0 else br
+        rows.append({"team_name":str(t.get("team_name","")), "per_open_starter":pos})
+    L = pd.DataFrame(rows)
+    med = float(L["per_open_starter"].median()) if not L.empty else 1.0
+    if med == 0: med = 1.0
+    L["liquidity_factor"] = L["per_open_starter"] / med
+    return L
+
+# --------------------------- Recommendations (inflation+scarcity, no team bias) ---------------------------
+def compute_recommended_values(df_players: pd.DataFrame, budget=200, teams=14, league_df: pd.DataFrame=None, draft_df: pd.DataFrame=None):
+    """Compute soft_rec_$ using:
+       base=AAV (fallback VOR/Points) → blended inflation (global+recent) → positional scarcity multiplier.
+       Team bias removed. hard_cap_$ = soft_rec_$ * 1.10.
+    """
+    df = df_players.copy()
+    aav = pd.to_numeric(df.get("AAV"), errors="coerce")
+    vor = pd.to_numeric(df.get("VOR"), errors="coerce")
+    pts = pd.to_numeric(df.get("Points"), errors="coerce")
+
+    # --- Base values ---
+    base = aav.copy() if "AAV" in df.columns else pd.Series([float("nan")]*len(df), index=df.index)
+    if base.isna().all() and vor.notna().sum()>0:
+        pos_v = vor.clip(lower=0); pool=budget*teams; tv=pos_v.sum()
+        base = (pos_v/tv*pool) if tv>0 else pos_v
+    if base.isna().all() and pts.notna().sum()>0:
+        pos_p = pts.clip(lower=0); pool=budget*teams; tp=pos_p.sum()
+        base = (pos_p/tp*pool) if tp>0 else pos_p
+    if base.isna().all():
+        base = pd.Series([0.0]*len(df), index=df.index)
+
+    drafted = df.get("status","").astype(str).str.lower().eq("drafted")
+    paid = pd.to_numeric(df.get("price_paid"), errors="coerce").fillna(0)
+
+    # --- Global inflation (remaining budget ÷ remaining base) or fallback to actual/expected ---
+    inflation_global = 1.0
+    used_remaining_model = False
+    try:
+        if league_df is not None and not league_df.empty and "budget_remaining" in league_df.columns:
+            remaining_budget = pd.to_numeric(league_df["budget_remaining"], errors="coerce").fillna(0).sum()
+            remaining_base   = base.where(~drafted, 0).sum(skipna=True)
+            if remaining_base and remaining_base > 0:
+                inflation_global = float(remaining_budget) / float(remaining_base)
+                used_remaining_model = True
+    except Exception:
+        pass
+    if not used_remaining_model:
+        exp_spend = base.where(drafted, 0).sum(skipna=True)
+        act_spend = paid.sum()
+        if exp_spend and exp_spend>0:
+            inflation_global = act_spend/exp_spend
+
+    # --- Recent inflation from last ~12 picks (avg price ÷ avg AAV) ---
+    inflation_recent = inflation_global
+    try:
+        if draft_df is not None and not draft_df.empty:
+            recent = draft_df.tail(12).copy()
+            # join recent picks to AAV by Player/Team/Position to get their baseline
+            keys = ["Player","Team","Position"]
+            have_keys = all(k in df.columns for k in keys)
+            if have_keys and all(k in recent.columns for k in ["Player","Team","Position","price"]):
+                tmp = recent.merge(df[keys+["AAV"]], on=keys, how="left", suffixes=("","_p"))
+                avg_paid = pd.to_numeric(tmp["price"], errors="coerce").mean()
+                avg_aav  = pd.to_numeric(tmp["AAV"], errors="coerce").mean()
+                if avg_aav and avg_aav>0:
+                    inflation_recent = max(0.5, min(2.0, float(avg_paid/avg_aav)))
+    except Exception:
+        pass
+
+    # --- Blend and clamp (keep conservative to avoid overreacting) ---
+    blended_infl = 0.5*float(inflation_global) + 0.5*float(inflation_recent)
+    blended_infl = max(0.85, min(1.20, blended_infl))
+
+    # --- Positional scarcity (starters only; FLEX split across RB/WR/TE) ---
+    scarcity_mult = pd.Series([1.0]*len(df), index=df.index)
+    try:
+        needs = league_starter_needs(league_df) if league_df is not None else {}
+        supply = position_supply(df)
+        ratios = {}
+        for p in df["Position"].dropna().unique().tolist():
+            need = float(needs.get(p, 0))
+            sup  = float(max(1, supply.get(p, 1)))
+            ratios[p] = (need/sup) if sup>0 else 1.0
+        if ratios:
+            median_ratio = pd.Series(ratios).median()
+            if not median_ratio or median_ratio<=0: median_ratio = 1.0
+            # sensitivity 0.35, bounded 0.90–1.15
+            def mult_for_pos(p):
+                r = ratios.get(p, 1.0) / median_ratio
+                m = 1.0 + 0.35*(r - 1.0)
+                return float(max(0.90, min(1.15, m)))
+            scarcity_mult = df["Position"].map(mult_for_pos).fillna(1.0)
+    except Exception:
+        pass
+
+    soft = (base * blended_infl * scarcity_mult).clip(lower=1).round(0)
+    hard = (soft * 1.10).round(0)
+
+    out = df.copy()
+    out["(auto) inflation_index"] = blended_infl
+    out["soft_rec_$"] = soft
+    out["hard_cap_$"] = hard
+    return out
+
+def write_recommendations_to_players(sh, teams=14, budget=200):
+    ws = sh.worksheet("Players")
+    df = normalize_cols(ws_to_df(ws))
+    for c in ["AAV","VOR","Points","status","price_paid","Team","Player","Position","Rank Position"]:
+        if c not in df.columns: df[c] = ""
+
+    # Load League_Teams for remaining-budget model and scarcity
+    league_df_local = pd.DataFrame()
+    try:
+        ws_league = sh.worksheet("League_Teams")
+        league_df_local = normalize_cols(ws_to_df(ws_league))
+    except Exception:
+        pass
+
+    # Load Draft_Log for recent inflation blending
+    draft_df_local = pd.DataFrame()
+    try:
+        ws_d = sh.worksheet("Draft_Log")
+        draft_df_local = normalize_cols(ws_to_df(ws_d))
+        for c in ["price"]:
+            if c in draft_df_local.columns:
+                draft_df_local[c] = pd.to_numeric(draft_df_local[c], errors="coerce")
+    except Exception:
+        pass
+
+    out = compute_recommended_values(df, budget=budget, teams=teams, league_df=league_df_local, draft_df=draft_df_local)
+    merged = df.merge(
+        out[["Player","Team","Position","(auto) inflation_index","soft_rec_$","hard_cap_$"]],
+        on=["Player","Team","Position"], how="left", suffixes=("","_new")
+    )
+    for c in ["(auto) inflation_index","soft_rec_$","hard_cap_$"]:
+        if f"{c}_new" in merged.columns:
+            merged[c] = merged[f"{c}_new"]; merged.drop(columns=[f"{c}_new"], inplace=True, errors="ignore")
+
+    # --- preserve tag columns on write ---
+    merged = ensure_tag_columns(merged)
+
+    write_dataframe_to_sheet(ws, merged, header=True)
+    return True, "Recommendations updated."
+
+# --------------------------- League_Teams helpers (per-position) ---------------------------
 def update_league_team_after_pick(sh, team_name, position, price):
     ws = sh.worksheet("League_Teams")
     df = normalize_cols(ws_to_df(ws))
@@ -493,6 +599,7 @@ def update_league_team_after_pick(sh, team_name, position, price):
             df.at[i, col] = int(pd.to_numeric(row[col], errors="coerce") or 0)
         max_bid, pps = recompute_maxbid_and_pps(df.loc[i, :], open_map)
         if "max_bid" in df.columns: df.at[i, "max_bid"] = int(max_bid)
+        # keep underlying column unchanged; we display per-starter in UI
         if "(auto)_$per_open_slot" in df.columns: df.at[i, "(auto)_$per_open_slot"] = int(pps)
     else:
         if "roster_spots_open" in df.columns:
@@ -645,6 +752,7 @@ def build_bidding_heatmap(league_df: pd.DataFrame):
         team = str(t.get("team_name",""))
         br   = pd.to_numeric(t.get("budget_remaining",""), errors="coerce")
         mb   = pd.to_numeric(t.get("max_bid",""), errors="coerce")
+        # For heatmap, keep legacy pps column usage (no functional change)
         pps  = pd.to_numeric(t.get("(auto)_$per_open_slot",""), errors="coerce")
         if pd.isna(br): br = 0
         if pd.isna(mb): mb = 0
@@ -653,7 +761,7 @@ def build_bidding_heatmap(league_df: pd.DataFrame):
         def get(col):
             return int(pd.to_numeric(t.get(col,0), errors="coerce") or 0)
 
-        avail = {p: get(open_map[p]) if p in open_map else 0 for p in POS_KEYS}
+        avail = {p: get(open_map[p]) if p in open_map else 0 for p in ["QB","RB","WR","TE","FLEX","K","DST","BENCH"]}
         # baseline heat: if slot available, potential = max(pps, min(mb, br)) scaled by need type
         base_potential = max(int(pps), int(min(br, mb)))
         if base_potential < 0: base_potential = 0
@@ -970,15 +1078,26 @@ for c in ["status","Position","Player","Team","soft_rec_$","AAV","ADP","VOR","Po
     if c not in players_df.columns:
         players_df[c] = (float("nan") if c in ("soft_rec_$","AAV","ADP","VOR","Points","Rank Overall","Rank Position") else "")
 
-# --------------------------- Top Alerts (Tier collapse) ---------------------------
+# --------------------------- Top Alerts (Tier collapse, dismissible) ---------------------------
 if not players_df.empty:
     try:
         _tiers_alert = compute_point_tiers(players_df)
         _msgs = tier_collapse_flags(_tiers_alert, warn_at=2)
+        if "dismissed_alerts" not in st.session_state:
+            st.session_state["dismissed_alerts"] = set()
         if _msgs:
-            st.write("")  # space under header
+            st.write("")  # spacing
             for m in _msgs:
-                st.warning(m, icon="🔔")
+                if m in st.session_state["dismissed_alerts"]:
+                    continue
+                cc = st.container()
+                c1, c2 = cc.columns([0.92, 0.08])
+                with c1:
+                    st.warning(m, icon="🔔")
+                with c2:
+                    if st.button("Dismiss", key=f"dismiss_{hash(m)}"):
+                        st.session_state["dismissed_alerts"].add(m)
+                        st.experimental_rerun()
     except Exception:
         pass
 
@@ -994,7 +1113,7 @@ with col_log:
     else:
         dfD = get_draft_log_cached(SHEET_ID, SA_JSON)
         # Use canonical column names produced by normalize_cols()
-        show_cols = ["pick","Player","Position","manager","price"]  # removed 'Team' as requested
+        show_cols = ["pick","Player","Position","manager","price"]  # removed 'Team'
         for c in show_cols:
             if c not in dfD.columns: dfD[c]=""
         if dfD.empty:
@@ -1004,12 +1123,13 @@ with col_log:
             dfD_disp["price"] = pd.to_numeric(dfD_disp["price"], errors="coerce").fillna(0).astype(int)
             st.dataframe(dfD_disp[show_cols].tail(15), hide_index=True, use_container_width=True, height=300)
 
-            # simple live trends (last 10 picks)
+            # unified caption styling (single caption, no italics)
             recent = dfD_disp.tail(10)
             avg_recent = int(round(recent["price"].mean())) if len(recent)>0 else 0
             by_pos = recent.groupby("Position")["price"].mean().sort_values(ascending=False)
             by_pos_txt = " • ".join([f"{p}: ${int(round(v))}" for p,v in by_pos.items()]) if not by_pos.empty else "—"
-            st.caption(f"Total picks: {len(dfD_disp)} • Avg price: ${int(dfD_disp['price'].mean()) if len(dfD_disp)>0 else 0} • Last 10 avg: ${avg_recent} • By pos (last 10): {by_pos_txt}")
+            all_avg = int(round(dfD_disp['price'].mean())) if len(dfD_disp)>0 else 0
+            st.caption(f"Total picks: {len(dfD_disp)} • Avg price: ${all_avg} • Last 10 avg: ${avg_recent} • By pos (last 10): {by_pos_txt}")
 
 with col_best:
     st.subheader("💎 Best Remaining Values")
@@ -1054,6 +1174,27 @@ with col_best:
         )
         st.dataframe(display_df, hide_index=True, use_container_width=True, height=300)
 
+        # --- Compact Liquidity Map under this table ---
+        if not league_df.empty and "team_name" in league_df.columns:
+            st.caption("Liquidity Map (relative to league median $/open starter)")
+            L = compute_liquidity_metrics(league_df)
+            if not L.empty:
+                # order by factor desc
+                L = L.sort_values("liquidity_factor", ascending=False)
+                # Create a compact colored label bar
+                html_spans=[]
+                for _,r in L.iterrows():
+                    t = str(r["team_name"])
+                    f = float(r["liquidity_factor"])
+                    # map factor to green->red via hue (120 good, 0 bad)
+                    hue = int(max(0, min(120, (f-0.75)/(1.5-0.75)*120))) if f<=1.5 else 120
+                    # clamp lightness
+                    bg = f"hsl({hue},70%,80%)"
+                    html_spans.append(f"<span style='display:inline-block;padding:4px 8px;margin:2px;border-radius:6px;background:{bg};white-space:nowrap;font-size:12px'>{t}</span>")
+                st.markdown("<div>"+ "".join(html_spans) +"</div>", unsafe_allow_html=True)
+            else:
+                st.caption("Liquidity Map unavailable.")
+
 with col_teams:
     st.subheader("👥 Teams")
     if league_df.empty or "team_name" not in league_df.columns:
@@ -1068,14 +1209,22 @@ with col_teams:
             # extract scalars safely from the single-row frame
             br = safe_int_val(rowT["budget_remaining"].iloc[0] if "budget_remaining" in rowT.columns else 0, 0)
             mb = safe_int_val(rowT["max_bid"].iloc[0] if "max_bid" in rowT.columns else 0, 0)
-            pps = safe_int_val(rowT["(auto)_$per_open_slot"].iloc[0] if "(auto)_$per_open_slot" in rowT.columns else 0, 0)
-            m1, m2, m3 = st.columns(3)
+
+            # starters-focused $/open metric + liquidity factor
+            open_map = detect_open_cols(league_df)
+            starters_open = starter_open_count_row(rowT.iloc[0], open_map) if open_map else safe_int_val(rowT.get("roster_spots_open", pd.Series([0])).iloc[0], 0)
+            per_open_starter = int(round(br / starters_open)) if starters_open>0 else br
+
+            L_all = compute_liquidity_metrics(league_df)
+            my_liq = float(L_all.loc[L_all["team_name"].astype(str)==str(choose_team), "liquidity_factor"].iloc[0]) if not L_all.empty and (L_all["team_name"].astype(str)==str(choose_team)).any() else 1.0
+
+            m1, m2, m3, m4 = st.columns(4)
             m1.metric("Budget Remaining", f"${br}")
             m2.metric("Max Bid", f"${mb}")
-            m3.metric("$ / Open Slot", f"${pps}")
+            m3.metric("$ / Open Starter", f"${per_open_starter}")
+            m4.metric("Liquidity Factor", f"{my_liq:.2f}")
 
             # quick needs insight
-            open_map = detect_open_cols(league_df)
             needs_txt = ""
             if open_map:
                 needs_counts = {}
@@ -1160,7 +1309,23 @@ with f3:
     team_opts = sorted([t for t in players_df.get("Team", pd.Series()).dropna().unique().tolist() if t])
     team_sel = st.multiselect("Teams", team_opts, default=[])
 with f4: hide_drafted = st.toggle("Hide drafted", value=True)
-with f5: sort_by = st.selectbox("Sort by", ["Rank Overall","soft_rec_$","AAV","VOR","Points","ADP","Rank Position"], index=0)
+with f5: sort_by = st.selectbox("Sort by", ["Rank Overall","soft_rec_$","AAV","VOR","Points","ADP","Rank Position","Δ$ (Value)"], index=0)
+
+# Extra filter row: Tags filter
+tag_col_map = {
+    "My Guy":"FFG_MyGuy",
+    "Sleeper":"FFG_Sleeper",
+    "Bust":"FFG_Bust",
+    "Value":"FFG_Value",
+    "Breakout":"FFG_Breakout",
+    "Avoid":"FFG_Avoid",
+    "Injured":"FFG_Injury",
+}
+tcol1, tcol2 = st.columns([1,4])
+with tcol1:
+    st.write("")  # spacing to align a bit
+with tcol2:
+    tag_filter = st.multiselect("Filter Tags", list(tag_col_map.keys()), default=[])
 
 # --------------------------- Draft Board (with checkbox selection & inline form) ---------------------------
 st.subheader("📋 Draft Board")
@@ -1185,22 +1350,34 @@ else:
         return " ".join(out)
     view["Tags"] = view.apply(tag_icons_row, axis=1) if not view.empty else ""
 
+    # Derived Value column
+    view["Δ$ (Value)"] = (pd.to_numeric(view.get("soft_rec_$"), errors="coerce") - pd.to_numeric(view.get("AAV"), errors="coerce")).round(0)
+
     if q: view = view[view["Player"].str.contains(q, case=False, na=False)]
     if pos_sel: view = view[view["Position"].isin(pos_sel)]
     if team_sel: view = view[view["Team"].isin(team_sel)]
+
+    # Tag filter application
+    if tag_filter:
+        mask = pd.Series([True]*len(view))
+        for nice in tag_filter:
+            col = tag_col_map[nice]
+            if col not in view.columns:
+                view[col] = ""
+            mask = mask & view[col].astype(str).str.lower().isin(["true","1","yes","y"])
+        view = view[mask]
+
     if hide_drafted and "status" in view.columns:
         view = view[~view["status"].astype(str).str.lower().eq("drafted")]
 
     ascending = sort_by in ["Rank Overall","ADP","Rank Position"]
-    if sort_by in view.columns:
-        view = view.sort_values(by=sort_by, ascending=ascending, na_position="last")
-    else:
-        view = view.sort_values(by="Rank Overall", ascending=True, na_position="last")
+    sort_key = sort_by if sort_by in view.columns else "Rank Overall"
+    view = view.sort_values(by=sort_key, ascending=ascending, na_position="last")
 
     # Add "Pos Rk" derived column for display convenience
     view["Pos Rk"] = pd.to_numeric(view.get("Rank Position"), errors="coerce")
 
-    show_cols = ["Tags","Position","Player","Team","soft_rec_$","hard_cap_$","AAV","VOR","Points","ADP","Rank Overall","status","drafted_by","price_paid","Pos Rk"]
+    show_cols = ["Tags","Position","Player","Team","soft_rec_$","hard_cap_$","AAV","Δ$ (Value)","VOR","Points","ADP","Rank Overall","status","drafted_by","price_paid","Pos Rk"]
     for c in show_cols:
         if c not in view.columns: view[c]=""
 
@@ -1218,6 +1395,7 @@ else:
             "Position": st.column_config.TextColumn("Pos"),
             "soft_rec_$": st.column_config.NumberColumn("Rec $"),
             "hard_cap_$": st.column_config.NumberColumn("Hard Cap"),
+            "Δ$ (Value)": st.column_config.NumberColumn("Value (Δ$)"),
             "status": st.column_config.TextColumn("Status"),
             "drafted_by": st.column_config.TextColumn("Drafted By"),
             "price_paid": st.column_config.NumberColumn("Price"),
@@ -1395,4 +1573,4 @@ with st.expander("🏷️ Quick Tag Editor", expanded=True):
                 st.error(f"Tag update failed: {e}")
 
 # Footer
-st.caption("Auction GM • in-table draft • roster grid • heatmap • traps • tiers • cached logs")
+st.caption("Auction GM • in-table draft • roster grid • heatmap • traps • tiers • liquidity • cached logs")
