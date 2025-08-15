@@ -829,6 +829,90 @@ def build_bidding_heatmap(league_df: pd.DataFrame):
     H = pd.DataFrame(rows)
     H = H.set_index("Team")
     return H
+    
+    def build_nomination_traps(players_df: pd.DataFrame, league_df: pd.DataFrame, top_n: int = 10):
+    if players_df is None or players_df.empty:
+        return pd.DataFrame()
+    df = players_df.copy()
+    df = df[df.get("status","").astype(str).str.lower()!="drafted"].copy()
+
+    for c in ["soft_rec_$","AAV","ADP","VOR","Points","Rank Position"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    base_val = df["AAV"].copy()
+    if base_val.isna().all():
+        base_val = (df["soft_rec_$"] / 1.15)
+    df["surplus_$"] = df["soft_rec_$"] - base_val  # negative is bad (overpay risk)
+
+    # Avoid weight (very strong) — safe when column missing
+    avoid_series = df["FFG_Avoid"] if "FFG_Avoid" in df.columns else pd.Series([""]*len(df), index=df.index)
+    df["avoid_flag"] = avoid_series.astype(str).str.lower().isin(["true","1","yes","y"]).astype(int)
+
+    # Outbid count awareness
+    outbid_counts = []
+    if league_df is not None and not league_df.empty and "budget_remaining" in league_df.columns:
+        open_map = detect_open_cols(league_df)
+        for _, r in df.iterrows():
+            price = r.get("soft_rec_$")
+            pos   = r.get("Position","")
+            cnt = 0
+            for _, t in league_df.iterrows():
+                br = pd.to_numeric(t.get("budget_remaining",""), errors="coerce")
+                if pd.isna(price) or pd.isna(br) or br < price:
+                    continue
+                if open_map and not has_slot_for_position(t, pos, open_map):
+                    continue
+                cnt += 1
+            outbid_counts.append(cnt)
+    df["outbid_count"] = outbid_counts if outbid_counts else 0
+
+    # Scarcity factor reused
+    pos_list = df["Position"].dropna().unique().tolist()
+    pos_supply = {p: max(1, int((df["Position"] == p).sum())) for p in pos_list}
+    scarcity = {}
+    if league_df is not None and not league_df.empty:
+        open_map = detect_open_cols(league_df)
+        if open_map:
+            flex_total = 0
+            if "FLEX" in open_map:
+                flex_total = pd.to_numeric(league_df.get(open_map["FLEX"]), errors="coerce").fillna(0).sum()
+            for p in pos_list:
+                base_need = 0
+                if p in open_map:
+                    base_need = pd.to_numeric(league_df.get(open_map[p]), errors="coerce").fillna(0).sum()
+                extra = round(flex_total / 3) if p in ("RB","WR","TE") else 0
+                scarcity[p] = max(0, int(base_need) + int(extra))
+    def sca(p):
+        need = scarcity.get(p, 0)
+        sup  = max(1, pos_supply.get(p, 1))
+        return float(need) / float(sup)
+    df["scarcity_factor"] = df["Position"].map(sca).fillna(0.0)
+
+    # Trap score (heavily weight Avoid)
+    neg_surplus = (-df["surplus_$"]).clip(lower=0)
+    df["trap_score"] = (
+        0.60*df["avoid_flag"]
+        + 0.20*neg_surplus.rank(pct=True)
+        + 0.15*df["outbid_count"].rank(pct=True)
+        + 0.05*df["scarcity_factor"].rank(pct=True)
+    )
+
+    df["Tags"] = df.apply(lambda r: " ".join([
+        "⭐" if is_truthy(r.get("FFG_MyGuy","")) else "",
+        "💤" if is_truthy(r.get("FFG_Sleeper","")) else "",
+        "⚠️" if is_truthy(r.get("FFG_Bust","")) else "",
+        "💎" if is_truthy(r.get("FFG_Value","")) else "",
+        "🚀" if is_truthy(r.get("FFG_Breakout","")) else "",
+        "⛔" if is_truthy(r.get("FFG_Avoid","")) else "",
+        "🩹" if is_truthy(r.get("FFG_Injury","")) else "",
+    ]).replace("  "," ").strip(), axis=1)
+
+    cols = ["Tags","Position","Player","Team","soft_rec_$","AAV","surplus_$","outbid_count"]
+    for c in cols:
+        if c not in df.columns: df[c]=""
+    return df.sort_values(["trap_score"], ascending=False).head(top_n)[cols + ["trap_score"]]
+    
 
 # --------------------------- Nomination Trap Finder ---------------------------
 with st.expander("🪤 Nomination Trap Finder", expanded=False):
