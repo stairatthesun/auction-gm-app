@@ -681,6 +681,310 @@ def team_can_draft_player(league_df: pd.DataFrame, team_name: str, position: str
             return False, f"'{team_name}' has no open roster spots."
 
     return True, ""
+    
+# --------------------------- Draft Updates ---------------------------
+def update_player_drafted(sh, player_key, manager, price):
+    ws = sh.worksheet("Players")
+    df = normalize_cols(ws_to_df(ws))
+    for c in ["status","drafted_by","price_paid"]:
+        if c not in df.columns: df[c]=""
+    # keep tag columns intact on write
+    df = ensure_tag_columns(df)
+
+    mask = (df["Player"]==player_key[0]) & (df["Team"]==player_key[1]) & (df["Position"]==player_key[2])
+    if not mask.any():
+        raise RuntimeError("Player not found in Players sheet.")
+    idx = df.index[mask][0]
+    df.loc[idx,"status"]="drafted"
+    df.loc[idx,"drafted_by"]=manager
+    df.loc[idx,"price_paid"]=str(int(price)) if pd.notna(price) and price!="" else ""
+    write_dataframe_to_sheet(ws, df, header=True)
+    return True
+
+# --------------------------- Nomination Recommendations (position-aware) ---------------------------
+def build_nomination_list(players_df: pd.DataFrame, league_df: pd.DataFrame, top_n: int = 8):
+    df = players_df.copy() if players_df is not None else pd.DataFrame()
+    needed = ["status","Position","Player","Team","soft_rec_$","AAV","ADP","VOR","Points","Rank Position"]
+    for c in needed:
+        if c not in df.columns:
+            df[c] = "" if c not in ("soft_rec_$","AAV","ADP","VOR","Points","Rank Position") else float("nan")
+
+    df = df[~df["status"].astype(str).str.lower().eq("drafted")].copy()
+    for c in ["soft_rec_$","AAV","ADP","VOR","Points","Rank Position"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    if df.empty: return pd.DataFrame(), pd.DataFrame()
+
+    base_val = df["AAV"].copy()
+    if base_val.isna().all():
+        base_val = (df["soft_rec_$"] / 1.15)
+    df["value_surplus"] = df["soft_rec_$"] - base_val
+
+    pos_list = df["Position"].dropna().unique().tolist()
+    pos_supply = {p: max(1, int((df["Position"] == p).sum())) for p in pos_list}
+
+    scarcity = {}
+    if league_df is not None and not league_df.empty:
+        open_map = detect_open_cols(league_df)
+        if open_map:
+            flex_total = 0
+            if "FLEX" in open_map:
+                flex_total = pd.to_numeric(league_df.get(open_map["FLEX"]), errors="coerce").fillna(0).sum()
+            for p in pos_list:
+                base_need = 0
+                if p in open_map:
+                    base_need = pd.to_numeric(league_df.get(open_map[p]), errors="coerce").fillna(0).sum()
+                extra = round(flex_total / 3) if p in ("RB","WR","TE") else 0
+                scarcity[p] = max(0, int(base_need) + int(extra))
+
+    def sca(p):
+        need = scarcity.get(p, 0)
+        sup  = max(1, pos_supply.get(p, 1))
+        return float(need) / float(sup)
+
+    df["scarcity_factor"] = df["Position"].map(sca).fillna(0.0)
+
+    outbid_counts = []
+    if league_df is not None and not league_df.empty and "budget_remaining" in league_df.columns:
+        open_map = detect_open_cols(league_df)
+        for _, r in df.iterrows():
+            price = r.get("soft_rec_$")
+            pos   = r.get("Position","")
+            cnt = 0
+            for _, t in league_df.iterrows():
+                br = pd.to_numeric(t.get("budget_remaining",""), errors="coerce")
+                if pd.isna(price) or pd.isna(br) or br < price:
+                    continue
+                if open_map and not has_slot_for_position(t, pos, open_map):
+                    continue
+                cnt += 1
+            outbid_counts.append(cnt)
+    df["outbid_count"] = outbid_counts if outbid_counts else 0
+
+    val_surplus  = (df["value_surplus"]  - df["value_surplus"].median(skipna=True)).fillna(0)
+    scarcity_norm= (df["scarcity_factor"]- df["scarcity_factor"].median(skipna=True)).fillna(0)
+    outbid_norm  = (df["outbid_count"]  - df["outbid_count"].median(skipna=True)).fillna(0)
+    rp = pd.to_numeric(df.get("Rank Position"), errors="coerce")
+    rp_inv = (-rp.fillna(rp.max() if rp.notna().any() else 999)).fillna(0)
+    df["nom_score"] = 0.45*val_surplus + 0.30*scarcity_norm + 0.15*outbid_norm + 0.10*rp_inv
+
+    value_targets = df.sort_values(["nom_score"], ascending=False).head(top_n).copy()
+    enforcers    = df.sort_values(["outbid_count","scarcity_factor"], ascending=[False,False]).head(top_n).copy()
+
+    def reason(row):
+        parts=[]
+        if pd.notna(row.get("value_surplus")) and row["value_surplus"]>0: parts.append(f"+${int(row['value_surplus'])} surplus")
+        if pd.notna(row.get("scarcity_factor")) and row["scarcity_factor"]>0.5: parts.append("scarce pos")
+        if pd.notna(row.get("outbid_count")) and row["outbid_count"]>=3: parts.append(f"{int(row['outbid_count'])} can outbid")
+        return " • ".join(parts) if parts else "balanced"
+
+    def tag_emojis_row(r):
+        out=[]
+        if is_truthy(r.get("FFG_MyGuy","")): out.append("⭐")
+        if is_truthy(r.get("FFG_Sleeper","")): out.append("💤")
+        if is_truthy(r.get("FFG_Bust","")): out.append("⚠️")
+        if is_truthy(r.get("FFG_Value","")): out.append("💎")
+        if is_truthy(r.get("FFG_Breakout","")): out.append("🚀")
+        if is_truthy(r.get("FFG_Avoid","")): out.append("⛔")
+        if is_truthy(r.get("FFG_Injury","")): out.append("🩹")
+        return " ".join(out)
+
+    for _df in (value_targets, enforcers):
+        if not _df.empty:
+            _df["why"] = _df.apply(reason, axis=1)
+            _df["Tags"] = _df.apply(tag_emojis_row, axis=1)
+
+    return value_targets, enforcers
+
+# --------------------------- Bidding Heatmap ---------------------------
+def build_bidding_heatmap(league_df: pd.DataFrame):
+    if league_df is None or league_df.empty or "team_name" not in league_df.columns or "budget_remaining" not in league_df.columns:
+        return pd.DataFrame()
+    df = league_df.copy()
+    open_map = detect_open_cols(df)
+    if not open_map:
+        return pd.DataFrame()
+
+    rows = []
+    for _, t in df.iterrows():
+        team = str(t.get("team_name",""))
+        br   = pd.to_numeric(t.get("budget_remaining",""), errors="coerce")
+        mb   = pd.to_numeric(t.get("max_bid",""), errors="coerce")
+        pps  = pd.to_numeric(t.get("(auto)_$per_open_slot",""), errors="coerce")
+        if pd.isna(br): br = 0
+        if pd.isna(mb): mb = 0
+        if pd.isna(pps): pps = 0
+
+        def get(col):
+            return int(pd.to_numeric(t.get(col,0), errors="coerce") or 0)
+
+        avail = {p: get(open_map[p]) if p in open_map else 0 for p in ["QB","RB","WR","TE","FLEX","K","DST","BENCH"]}
+        base_potential = max(int(pps), int(min(br, mb)))
+        if base_potential < 0: base_potential = 0
+
+        row_vals = {}
+        for p in ("QB","RB","WR","TE","K","DST"):
+            heat = 0.0
+            if avail.get(p,0) > 0:
+                heat = base_potential * 1.0
+            elif p in ("RB","WR","TE") and avail.get("FLEX",0) > 0:
+                heat = base_potential * 0.6
+            elif avail.get("BENCH",0) > 0:
+                heat = base_potential * 0.2
+            row_vals[p] = round(heat, 0)
+        rows.append({"Team": team, **row_vals})
+
+    H = pd.DataFrame(rows).set_index("Team")
+    return H
+
+# --------------------------- Nomination Trap Finder ---------------------------
+def build_nomination_traps(players_df: pd.DataFrame, league_df: pd.DataFrame, top_n: int = 10):
+    if players_df is None or players_df.empty:
+        return pd.DataFrame()
+    df = players_df.copy()
+    df = df[df.get("status","").astype(str).str.lower()!="drafted"].copy()
+
+    for c in ["soft_rec_$","AAV","ADP","VOR","Points","Rank Position"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    base_val = df["AAV"].copy()
+    if base_val.isna().all():
+        base_val = (df["soft_rec_$"] / 1.15)
+    df["surplus_$"] = df["soft_rec_$"] - base_val  # negative is bad
+
+    avoid_series = df["FFG_Avoid"] if "FFG_Avoid" in df.columns else pd.Series([""]*len(df), index=df.index)
+    df["avoid_flag"] = avoid_series.astype(str).str.lower().isin(["true","1","yes","y"]).astype(int)
+
+    outbid_counts = []
+    if league_df is not None and not league_df.empty and "budget_remaining" in league_df.columns:
+        open_map = detect_open_cols(league_df)
+        for _, r in df.iterrows():
+            price = r.get("soft_rec_$")
+            pos   = r.get("Position","")
+            cnt = 0
+            for _, t in league_df.iterrows():
+                br = pd.to_numeric(t.get("budget_remaining",""), errors="coerce")
+                if pd.isna(price) or pd.isna(br) or br < price:
+                    continue
+                if open_map and not has_slot_for_position(t, pos, open_map):
+                    continue
+                cnt += 1
+            outbid_counts.append(cnt)
+    df["outbid_count"] = outbid_counts if outbid_counts else 0
+
+    pos_list = df["Position"].dropna().unique().tolist()
+    pos_supply = {p: max(1, int((df["Position"] == p).sum())) for p in pos_list}
+    scarcity = {}
+    if league_df is not None and not league_df.empty:
+        open_map = detect_open_cols(league_df)
+        if open_map:
+            flex_total = 0
+            if "FLEX" in open_map:
+                flex_total = pd.to_numeric(league_df.get(open_map["FLEX"]), errors="coerce").fillna(0).sum()
+            for p in pos_list:
+                base_need = 0
+                if p in open_map:
+                    base_need = pd.to_numeric(league_df.get(open_map[p]), errors="coerce").fillna(0).sum()
+                extra = round(flex_total / 3) if p in ("RB","WR","TE") else 0
+                scarcity[p] = max(0, int(base_need) + int(extra))
+    def sca(p):
+        need = scarcity.get(p, 0)
+        sup  = max(1, pos_supply.get(p, 1))
+        return float(need) / float(sup)
+    df["scarcity_factor"] = df["Position"].map(sca).fillna(0.0)
+
+    neg_surplus = (-df["surplus_$"]).clip(lower=0)
+    df["trap_score"] = 0.60*df["avoid_flag"] + 0.20*neg_surplus.rank(pct=True) + 0.15*df["outbid_count"].rank(pct=True) + 0.05*df["scarcity_factor"].rank(pct=True)
+
+    def tag_emojis_row(r):
+        out=[]
+        if is_truthy(r.get("FFG_MyGuy","")): out.append("⭐")
+        if is_truthy(r.get("FFG_Sleeper","")): out.append("💤")
+        if is_truthy(r.get("FFG_Bust","")): out.append("⚠️")
+        if is_truthy(r.get("FFG_Value","")): out.append("💎")
+        if is_truthy(r.get("FFG_Breakout","")): out.append("🚀")
+        if is_truthy(r.get("FFG_Avoid","")): out.append("⛔")
+        if is_truthy(r.get("FFG_Injury","")): out.append("🩹")
+        return " ".join(out)
+
+    df["Tags"] = df.apply(tag_emojis_row, axis=1)
+    cols = ["Tags","Position","Player","Team","soft_rec_$","AAV","surplus_$","outbid_count"]
+    for c in cols:
+        if c not in df.columns: df[c]=""
+    return df.sort_values(["trap_score"], ascending=False).head(top_n)[cols + ["trap_score"]]
+
+# --------------------------- Tiers (from Projections Tier) ---------------------------
+def _tag_emojis(row):
+    out=[]
+    if is_truthy(row.get("FFG_MyGuy","")): out.append("⭐")
+    if is_truthy(row.get("FFG_Sleeper","")): out.append("💤")
+    if is_truthy(row.get("FFG_Bust","")): out.append("⚠️")
+    if is_truthy(row.get("FFG_Value","")): out.append("💎")
+    if is_truthy(row.get("FFG_Breakout","")): out.append("🚀")
+    if is_truthy(row.get("FFG_Avoid","")): out.append("⛔")
+    if is_truthy(row.get("FFG_Injury","")): out.append("🩹")
+    return " ".join(out)
+
+def compute_sheet_tiers(players_df: pd.DataFrame) -> pd.DataFrame:
+    if players_df is None or players_df.empty:
+        return pd.DataFrame()
+    df = players_df.copy()
+    for c in ["Position","Player","Team","status","Tier"]:
+        if c not in df.columns: df[c] = ""
+    df["Tier"] = pd.to_numeric(df.get("Tier"), errors="coerce")
+    df = df[~df["Tier"].isna()].copy()
+    df["status"] = df["status"].astype(str).str.lower()
+    df["Tags"] = df.apply(_tag_emojis, axis=1)
+
+    def name_fmt(row):
+        nm = f"{row.get('Player','')}"
+        if row.get("status","") == "drafted":
+            nm = f"~~{nm}~~"
+        tag = row.get("Tags","")
+        if tag: nm = f"{nm} {tag}"
+        return nm
+
+    df["Display"] = df.apply(name_fmt, axis=1)
+    df["Tier"] = df["Tier"].astype(int)
+    return df
+
+def tier_collapse_flags(df_tiers: pd.DataFrame, warn_at: int = 2) -> list[str]:
+    if df_tiers is None or df_tiers.empty: return []
+    msgs=[]
+    for pos in sorted(df_tiers["Position"].dropna().unique().tolist()):
+        sub = df_tiers[df_tiers["Position"]==pos]
+        live = sub[sub["status"]!="drafted"]
+        if live.empty: continue
+        cur_tier = int(live["Tier"].min())
+        left = int((live["Tier"]==cur_tier).sum())
+        if left <= warn_at:
+            msgs.append(f"{pos} Tier {cur_tier} is about to break ({left} left).")
+    return msgs
+
+def render_tier_board(df_tiers: pd.DataFrame):
+    if df_tiers is None or df_tiers.empty:
+        st.caption("No tiers available (need Tier column from Projections).")
+        return
+    positions_order = ["QB","RB","WR","TE","FLEX","K","DST","BENCH"]
+    positions = sorted(
+        df_tiers["Position"].dropna().unique().tolist(),
+        key=lambda p: positions_order.index(p) if p in positions_order else 999
+    )
+    max_tier = int(df_tiers["Tier"].max())
+    header = "| Tier | " + " | ".join(positions) + " |"
+    sep    = "|:---:|" + "|".join([":---:" for _ in positions]) + "|"
+    lines = [header, sep]
+    for t in range(1, max_tier+1):
+        cells=[]
+        for pos in positions:
+            names = df_tiers[(df_tiers["Position"]==pos) & (df_tiers["Tier"]==t)]["Display"].tolist()
+            cells.append("<br/>".join(names) if names else "—")
+        lines.append(f"| {t} | " + " | ".join(cells) + " |")
+    table_md = "\n" + "\n".join(lines) + "\n"
+    st.markdown("<div style='width:100%; overflow-x:auto;'>", unsafe_allow_html=True)
+    st.markdown(table_md, unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+
 
 # --------------------------- UI — Sidebar ---------------------------
 with st.sidebar:
