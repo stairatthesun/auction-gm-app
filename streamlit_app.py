@@ -842,7 +842,8 @@ for c in ["status","Position","Player","Team","soft_rec_$","AAV","ADP","VOR","Po
 
 # --------------------------- Top Row: Draft Log + Best Values + Teams ---------------------------
 st.divider()
-col_log, col_best, col_teams = st.columns([1.2, 1.1, 1.3], gap="large")
+# widen the "Best Remaining Values" column a bit
+col_log, col_best, col_teams = st.columns([1.1, 1.5, 1.4], gap="large")
 
 with col_log:
     st.subheader("📜 Draft Log + Live Trends")
@@ -850,7 +851,8 @@ with col_log:
         st.caption("Connect write access to enable Draft Log.")
     else:
         dfD = get_draft_log_cached(SHEET_ID, SA_JSON)
-        show_cols = ["pick","player","team","position","manager","price"]
+        # Use canonical column names produced by normalize_cols()
+        show_cols = ["pick","Player","Position","manager","price"]  # removed 'Team' as requested
         for c in show_cols:
             if c not in dfD.columns: dfD[c]=""
         if dfD.empty:
@@ -858,8 +860,14 @@ with col_log:
         else:
             dfD_disp = dfD.copy()
             dfD_disp["price"] = pd.to_numeric(dfD_disp["price"], errors="coerce").fillna(0).astype(int)
-            st.dataframe(dfD_disp[show_cols].tail(15), hide_index=True, use_container_width=True, height=240)
-            st.caption(f"Total picks: {len(dfD_disp)} • Avg price: ${int(dfD_disp['price'].mean()) if len(dfD_disp)>0 else 0}")
+            st.dataframe(dfD_disp[show_cols].tail(15), hide_index=True, use_container_width=True, height=300)
+
+            # simple live trends (last 10 picks)
+            recent = dfD_disp.tail(10)
+            avg_recent = int(round(recent["price"].mean())) if len(recent)>0 else 0
+            by_pos = recent.groupby("Position")["price"].mean().sort_values(ascending=False)
+            by_pos_txt = " • ".join([f"{p}: ${int(round(v))}" for p,v in by_pos.items()]) if not by_pos.empty else "—"
+            st.caption(f"Total picks: {len(dfD_disp)} • Avg price: ${int(dfD_disp['price'].mean()) if len(dfD_disp)>0 else 0} • Last 10 avg: ${avg_recent} • By pos (last 10): {by_pos_txt}")
 
 with col_best:
     st.subheader("💎 Best Remaining Values")
@@ -902,7 +910,7 @@ with col_best:
                 "Rank Position":"Pos Rk",
             }
         )
-        st.dataframe(display_df, hide_index=True, use_container_width=True, height=240)
+        st.dataframe(display_df, hide_index=True, use_container_width=True, height=300)
 
 with col_teams:
     st.subheader("👥 Teams")
@@ -915,13 +923,37 @@ with col_teams:
 
         rowT = league_df.loc[league_df["team_name"]==choose_team].head(1)
         if not rowT.empty:
-            br = safe_int_val(rowT.get("budget_remaining", 0), 0)
-            mb = safe_int_val(rowT.get("max_bid", 0), 0)
-            pps = safe_int_val(rowT.get("(auto)_$per_open_slot", 0), 0)
+            # extract scalars safely from the single-row frame
+            br = safe_int_val(rowT["budget_remaining"].iloc[0] if "budget_remaining" in rowT.columns else 0, 0)
+            mb = safe_int_val(rowT["max_bid"].iloc[0] if "max_bid" in rowT.columns else 0, 0)
+            pps = safe_int_val(rowT["(auto)_$per_open_slot"].iloc[0] if "(auto)_$per_open_slot" in rowT.columns else 0, 0)
             m1, m2, m3 = st.columns(3)
             m1.metric("Budget Remaining", f"${br}")
             m2.metric("Max Bid", f"${mb}")
             m3.metric("$ / Open Slot", f"${pps}")
+
+            # quick needs insight
+            open_map = detect_open_cols(league_df)
+            needs_txt = ""
+            if open_map:
+                needs_counts = {}
+                for pos, col in open_map.items():
+                    try:
+                        needs_counts[pos] = int(pd.to_numeric(rowT[col].iloc[0], errors="coerce") or 0)
+                    except Exception:
+                        needs_counts[pos] = 0
+                # sort by largest need (ignore zeros and BENCH for clarity)
+                ordered = [f"{p}:{n}" for p,n in sorted(
+                    [(p,n) for p,n in needs_counts.items() if n>0 and p!="BENCH"],
+                    key=lambda x: -x[1]
+                )]
+                if not ordered and needs_counts.get("BENCH",0)>0:
+                    ordered = [f"BENCH:{needs_counts.get('BENCH',0)}"]
+                needs_txt = "Needs → " + (", ".join(ordered) if ordered else "All starters filled")
+            else:
+                needs_txt = "Needs → Roster_spots_open model (no per-position columns detected)."
+
+            st.caption(needs_txt)
 
         # Build a blank roster template
         template = [
