@@ -44,10 +44,13 @@ CANON = {
     "(auto)_recommended_soft$":"soft_rec_$",
     "(auto)_recommended_cap$":"hard_cap_$",
     "(auto)_inflation_global":"(auto) inflation_index",
+    # NEW: ensure Tier maps correctly from any source
+    "tier":"Tier"
 }
 
 IDENTITY_COLS = ["Player","Team","Position"]
-PROJ_COLS = ["Points","VOR","ADP","AAV","Rank Overall","Rank Position"]
+# NEW: include Tier in projection columns so Smart Sync carries it to Players
+PROJ_COLS = ["Points","VOR","ADP","AAV","Rank Overall","Rank Position","Tier"]
 
 # Known tag columns — used to ensure persistence on every write
 TAG_COLS = ["FFG_MyGuy","FFG_Sleeper","FFG_Bust","FFG_Value","FFG_Breakout","FFG_Avoid","FFG_Injury"]
@@ -212,7 +215,8 @@ def append_draft_log(sh, row: dict):
     ws.append_row(out, value_input_option="RAW")
 
 # --------------------------- Projections Import (CSV cleaner) ---------------------------
-TARGET_PROJ_COLS = ["Position","Player","Team","Points","VOR","ADP","AAV","Rank Overall","Rank Position"]
+# NEW: include Tier
+TARGET_PROJ_COLS = ["Position","Player","Team","Points","VOR","ADP","AAV","Rank Overall","Rank Position","Tier"]
 NAME_MAP = {
     "position":"Position","pos":"Position",
     "player":"Player","name":"Player","player_name":"Player",
@@ -223,6 +227,8 @@ NAME_MAP = {
     "aav":"AAV","aav_sleeper":"AAV","auction_value":"AAV",
     "rank":"Rank Overall","overall_rank":"Rank Overall",
     "position_rank":"Rank Position","pos_rank":"Rank Position",
+    # NEW
+    "tier":"Tier"
 }
 
 def clean_projection_csv(file_bytes: bytes) -> pd.DataFrame:
@@ -239,6 +245,9 @@ def clean_projection_csv(file_bytes: bytes) -> pd.DataFrame:
         df[col] = pd.to_numeric(df[col], errors="coerce")
     for c in ["Player","Team","Position"]:
         df[c] = df[c].astype(str).str.strip()
+    # ensure Tier is numeric if present
+    if "Tier" in df.columns:
+        df["Tier"] = pd.to_numeric(df["Tier"], errors="coerce")
     df = df[~df["Position"].str.upper().isin(IDP_POS)].reset_index(drop=True)
     df = df.drop_duplicates(subset=["Player","Team","Position"], keep="first")
     return df
@@ -861,8 +870,8 @@ def build_nomination_traps(players_df: pd.DataFrame, league_df: pd.DataFrame, to
         if c not in df.columns: df[c]=""
     return df.sort_values(["trap_score"], ascending=False).head(top_n)[cols + ["trap_score"]]
 
-# --------------------------- Tiers (static by expected points) ---------------------------
-TIER_MIN_DROP = {"QB":6, "RB":10, "WR":10, "TE":6, "K":2, "DST":2}
+# --------------------------- Tiers (from Projections Tier column) ---------------------------
+TIER_MIN_DROP = {"QB":6, "RB":10, "WR":10, "TE":6, "K":2, "DST":2}  # (kept; no longer used for calc)
 
 def _tag_emojis(row):
     out=[]
@@ -875,51 +884,21 @@ def _tag_emojis(row):
     if is_truthy(row.get("FFG_Injury","")): out.append("🩹")
     return " ".join(out)
 
-def assign_tiers_for_position(df_pos: pd.DataFrame, pos: str) -> pd.DataFrame:
-    x = df_pos.copy()
-    x["Points"] = pd.to_numeric(x.get("Points"), errors="coerce").fillna(-1e9)
-    x = x.sort_values("Points", ascending=False).reset_index(drop=True)
-    if x.empty:
-        x["Tier"] = 1
-        return x
-
-    diffs = x["Points"].shift(0) - x["Points"].shift(-1)
-    diffs = diffs.fillna(0)
-    try:
-        p80 = float(diffs.quantile(0.80))
-    except Exception:
-        p80 = 0.0
-    abs_floor = TIER_MIN_DROP.get(pos, 8)
-    threshold = max(p80, abs_floor)
-
-    tier = 1
-    tiers = [tier]
-    for i in range(len(x)-1):
-        if diffs.iloc[i] >= threshold:
-            tier += 1
-        tiers.append(tier)
-    x["Tier"] = tiers
-    return x
-
-def compute_point_tiers(players_df: pd.DataFrame) -> pd.DataFrame:
+def compute_sheet_tiers(players_df: pd.DataFrame) -> pd.DataFrame:
+    """Build tiers using the 'Tier' column synced from Projections (per position)."""
     if players_df is None or players_df.empty:
         return pd.DataFrame()
 
     df = players_df.copy()
-    for c in ["Position","Player","Team","Points","status"]:
+    for c in ["Position","Player","Team","status","Tier"]:
         if c not in df.columns: df[c] = ""
-    df["Points"] = pd.to_numeric(df.get("Points"), errors="coerce")
+    # coerce Tier to numeric and drop rows without a tier
+    df["Tier"] = pd.to_numeric(df.get("Tier"), errors="coerce")
+    df = df[~df["Tier"].isna()].copy()
+
     df["status"] = df["status"].astype(str).str.lower()
+    df["Tags"] = df.apply(_tag_emojis, axis=1)
 
-    frames=[]
-    for pos in df["Position"].dropna().unique().tolist():
-        sub = df[df["Position"]==pos].copy()
-        frames.append(assign_tiers_for_position(sub, pos))
-    if not frames:
-        return pd.DataFrame()
-    out = pd.concat(frames, ignore_index=True)
-
-    out["Tags"] = out.apply(_tag_emojis, axis=1)
     def name_fmt(row):
         nm = f"{row.get('Player','')}"
         if row.get("status","") == "drafted":
@@ -927,8 +906,11 @@ def compute_point_tiers(players_df: pd.DataFrame) -> pd.DataFrame:
         tag = row.get("Tags","")
         if tag: nm = f"{nm} {tag}"
         return nm
-    out["Display"] = out.apply(name_fmt, axis=1)
-    return out
+
+    df["Display"] = df.apply(name_fmt, axis=1)
+    # ensure integer tiers for grouping/rendering
+    df["Tier"] = df["Tier"].astype(int)
+    return df
 
 def tier_collapse_flags(df_tiers: pd.DataFrame, warn_at: int = 2) -> list[str]:
     if df_tiers is None or df_tiers.empty: return []
@@ -945,7 +927,7 @@ def tier_collapse_flags(df_tiers: pd.DataFrame, warn_at: int = 2) -> list[str]:
 
 def render_tier_board(df_tiers: pd.DataFrame):
     if df_tiers is None or df_tiers.empty:
-        st.caption("No tiers available (need Points).")
+        st.caption("No tiers available (need Tier column from Projections).")
         return
     positions_order = ["QB","RB","WR","TE","FLEX","K","DST","BENCH"]
     positions = sorted(
@@ -962,7 +944,11 @@ def render_tier_board(df_tiers: pd.DataFrame):
             names = df_tiers[(df_tiers["Position"]==pos) & (df_tiers["Tier"]==t)]["Display"].tolist()
             cells.append("<br>".join(names) if names else "—")
         lines.append(f"| {t} | " + " | ".join(cells) + " |")
-    st.markdown("\n".join(lines), unsafe_allow_html=True)
+    # full-width markdown in container
+    st.markdown(
+        "<div style='width:100%'>" + "\n".join(lines) + "</div>",
+        unsafe_allow_html=True
+    )
 
 # --------------------------- UI — Sidebar ---------------------------
 with st.sidebar:
@@ -1074,30 +1060,46 @@ if 'sh' in locals() and write_ready:
 # Safety net
 if players_df is None or players_df.empty:
     players_df = pd.DataFrame()
-for c in ["status","Position","Player","Team","soft_rec_$","AAV","ADP","VOR","Points","Rank Overall","Rank Position","drafted_by","price_paid"]:
+for c in ["status","Position","Player","Team","soft_rec_$","AAV","ADP","VOR","Points","Rank Overall","Rank Position","drafted_by","price_paid","Tier"]:
     if c not in players_df.columns:
-        players_df[c] = (float("nan") if c in ("soft_rec_$","AAV","ADP","VOR","Points","Rank Overall","Rank Position") else "")
+        players_df[c] = (float("nan") if c in ("soft_rec_$","AAV","ADP","VOR","Points","Rank Overall","Rank Position","Tier") else "")
 
 # --------------------------- Top Alerts (Tier collapse, dismissible) ---------------------------
-if not players_df.empty:
+# NEW: only show alerts AFTER the first pick has been made
+def picks_started() -> bool:
     try:
-        _tiers_alert = compute_point_tiers(players_df)
-        _msgs = tier_collapse_flags(_tiers_alert, warn_at=2)
+        dfD = get_draft_log_cached(SHEET_ID, SA_JSON)
+        if not dfD.empty:
+            return True
+    except Exception:
+        pass
+    # fallback: any drafted status in Players
+    try:
+        return players_df.get("status","").astype(str).str.lower().eq("drafted").any()
+    except Exception:
+        return False
+
+if not players_df.empty and picks_started():
+    try:
+        df_tiers_alert = compute_sheet_tiers(players_df)
+        _msgs = tier_collapse_flags(df_tiers_alert, warn_at=2)
         if "dismissed_alerts" not in st.session_state:
-            st.session_state["dismissed_alerts"] = set()
+            # use dict of keys->True for stable behavior
+            st.session_state["dismissed_alerts"] = {}
         if _msgs:
             st.write("")  # spacing
-            for m in _msgs:
-                if m in st.session_state["dismissed_alerts"]:
+            for i, m in enumerate(_msgs):
+                k = f"alert_{i}_{abs(hash(m))}"
+                if st.session_state["dismissed_alerts"].get(k):
                     continue
                 cc = st.container()
                 c1, c2 = cc.columns([0.92, 0.08])
                 with c1:
                     st.warning(m, icon="🔔")
                 with c2:
-                    if st.button("Dismiss", key=f"dismiss_{hash(m)}"):
-                        st.session_state["dismissed_alerts"].add(m)
-                        st.experimental_rerun()
+                    if st.button("Dismiss", key=f"dismiss_{k}"):
+                        st.session_state["dismissed_alerts"][k] = True
+                        st.rerun()
     except Exception:
         pass
 
@@ -1300,7 +1302,8 @@ with col_teams:
 
 # --------------------------- Filters (under the top 3 modules) ---------------------------
 st.divider()
-f1,f2,f3,f4,f5 = st.columns([2,1,1,1,1], gap="large")
+# NEW: put Tags filter on the same row as the other filters
+f1,f2,f3,f4,f5,f6 = st.columns([2,1,1,1,1,1], gap="large")
 with f1: q = st.text_input("Search", "")
 with f2:
     pos_opts = sorted([p for p in players_df.get("Position", pd.Series()).dropna().unique().tolist() if p])
@@ -1310,22 +1313,17 @@ with f3:
     team_sel = st.multiselect("Teams", team_opts, default=[])
 with f4: hide_drafted = st.toggle("Hide drafted", value=True)
 with f5: sort_by = st.selectbox("Sort by", ["Rank Overall","soft_rec_$","AAV","VOR","Points","ADP","Rank Position","Δ$ (Value)"], index=0)
-
-# Extra filter row: Tags filter
-tag_col_map = {
-    "My Guy":"FFG_MyGuy",
-    "Sleeper":"FFG_Sleeper",
-    "Bust":"FFG_Bust",
-    "Value":"FFG_Value",
-    "Breakout":"FFG_Breakout",
-    "Avoid":"FFG_Avoid",
-    "Injured":"FFG_Injury",
-}
-tcol1, tcol2 = st.columns([1,4])
-with tcol1:
-    st.write("")  # spacing to align a bit
-with tcol2:
-    tag_filter = st.multiselect("Filter Tags", list(tag_col_map.keys()), default=[])
+with f6:
+    tag_col_map = {
+        "My Guy":"FFG_MyGuy",
+        "Sleeper":"FFG_Sleeper",
+        "Bust":"FFG_Bust",
+        "Value":"FFG_Value",
+        "Breakout":"FFG_Breakout",
+        "Avoid":"FFG_Avoid",
+        "Injured":"FFG_Injury",
+    }
+    tag_filter = st.multiselect("Tags", list(tag_col_map.keys()), default=[])
 
 # --------------------------- Draft Board (with checkbox selection & inline form) ---------------------------
 st.subheader("📋 Draft Board")
@@ -1495,15 +1493,15 @@ with st.expander("🧠 Nomination Recommendations (position-aware)", expanded=Fa
                 if c not in enf_list.columns: enf_list[c]=""
             st.dataframe(enf_list[cols], hide_index=True, use_container_width=True, height=240)
 
-# --------------------------- Tier Board (static by expected points) ---------------------------
-with st.expander("🏷️ Tiers by Expected Points (static)", expanded=False):
+# --------------------------- Tier Board (from Projections Tier) ---------------------------
+with st.expander("🏷️ Tiers (from Projections)", expanded=False):
     if players_df.empty:
         st.caption("Load players first.")
     else:
         try:
-            df_tiers = compute_point_tiers(players_df)
+            df_tiers = compute_sheet_tiers(players_df)
             render_tier_board(df_tiers)
-            st.caption("Tiering uses points-based gaps (pos-dependent floors + 80th percentile drop). Drafted players shown with strikethrough.")
+            st.caption("Tiering uses the 'Tier' column provided in Projections (per position). Drafted players shown with strikethrough.")
         except Exception as e:
             st.caption(f"Tiers unavailable: {e}")
 
