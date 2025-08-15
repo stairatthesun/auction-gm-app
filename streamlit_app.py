@@ -942,14 +942,14 @@ def render_tier_board(df_tiers: pd.DataFrame):
         cells=[]
         for pos in positions:
             names = df_tiers[(df_tiers["Position"]==pos) & (df_tiers["Tier"]==t)]["Display"].tolist()
-            cells.append("<br>".join(names) if names else "—")
+            cells.append("<br/>".join(names) if names else "—")
         lines.append(f"| {t} | " + " | ".join(cells) + " |")
     # full-width markdown in container
     table_md = "\n" + "\n".join(lines) + "\n"
-    st.markdown(
-        f"<div style='width:100%; overflow-x:auto;'>{st.markdown(table_md)}</div>",
-        unsafe_allow_html=True
-    )
+    st.markdown("<div style='width:100%; overflow-x:auto;'>", unsafe_allow_html=True)
+    st.markdown(table_md, unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+
 
 
 # --------------------------- UI — Sidebar ---------------------------
